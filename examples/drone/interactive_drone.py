@@ -111,7 +111,7 @@ def run_sim(scene, drone, controller):
 
 def main():
     # Initialize Genesis
-    gs.init(backend=gs.cpu)
+    gs.init(backend=gs.gpu)
 
     # Create scene
     scene = gs.Scene(

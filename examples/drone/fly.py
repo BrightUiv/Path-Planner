@@ -12,9 +12,10 @@ def main():
     args = parser.parse_args()
 
     ########################## init ##########################
-    gs.init(backend=gs.cpu)
+    gs.init(backend=gs.gpu)
 
     ########################## create a scene ##########################
+    # 设置相机的位置
     viewer_options = gs.options.ViewerOptions(
         camera_pos=(2.5, 0.0, 1.5),
         camera_lookat=(0.0, 0.0, 0.5),
@@ -24,16 +25,18 @@ def main():
 
     scene = gs.Scene(
         sim_options=gs.options.SimOptions(
-            dt=0.01,
+            dt=0.01, # 100HZ 每个仿真步的时间间隔
         ),
-        viewer_options=viewer_options,
-        show_viewer=args.vis,
+        viewer_options=viewer_options, # 可视化选项
+        show_viewer=args.vis, #判断是否是显示页面
     )
 
     ########################## entities ##########################
+    # 添加障碍物以及地面
     plane = scene.add_entity(
         gs.morphs.Plane(),
     )
+    # 添加无人机的页面
     drone = scene.add_entity(
         morph=gs.morphs.Drone(
             file="urdf/drones/cf2x.urdf",

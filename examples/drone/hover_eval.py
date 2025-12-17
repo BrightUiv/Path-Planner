@@ -60,12 +60,19 @@ def main():
     max_sim_step = int(env_cfg["episode_length_s"] * env_cfg["max_visualize_FPS"])
     with torch.no_grad():
         if args.record:
+            # 创建视频保存目录
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            video_dir = os.path.join(script_dir, "video")
+            os.makedirs(video_dir, exist_ok=True)
+            video_path = os.path.join(video_dir, "hover_video.mp4")
+            
             env.cam.start_recording()
             for _ in range(max_sim_step):
                 actions = policy(obs)
                 obs, rews, dones, infos = env.step(actions)
                 env.cam.render()
-            env.cam.stop_recording(save_to_filename="video.mp4", fps=env_cfg["max_visualize_FPS"])
+            env.cam.stop_recording(save_to_filename=video_path, fps=env_cfg["max_visualize_FPS"])
+            print(f"视频已保存到 {video_path}")
         else:
             for _ in range(max_sim_step):
                 actions = policy(obs)
@@ -74,6 +81,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # 强制退出避免pyrender线程清理错误
+    import sys
+    import os
+    os._exit(0)
 
 """
 # evaluation
