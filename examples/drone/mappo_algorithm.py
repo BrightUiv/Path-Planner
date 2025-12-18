@@ -28,7 +28,7 @@ class MAPPOActor(nn.Module):
         
         self.backbone = nn.Sequential(*layers)
         self.mean_head = nn.Linear(prev_dim, action_dim)
-        # 可学习的log_std，初始值较大以鼓励探索
+        # 可学习的log_std，初始值较大以鼓励探索 
         self.log_std = nn.Parameter(torch.ones(action_dim) * np.log(init_std))
         
         # 初始化

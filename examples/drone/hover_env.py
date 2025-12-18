@@ -15,6 +15,12 @@ def gs_rand_float(lower, upper, shape, device):
     return (upper - lower) * torch.rand(size=shape, device=device) + lower
 
 
+'''
+    1. 初始化基础配置
+    2. 搭建环境的地面、障碍物
+    3. 添加无人机
+
+'''
 class HoverEnv:
     """无人机悬停任务的强化学习环境"""
 
@@ -29,7 +35,7 @@ class HoverEnv:
         self.device = gs.device
 
         self.simulate_action_latency = env_cfg["simulate_action_latency"]  # 是否模拟动作延迟
-        self.dt = 0.01  # 仿真时间步长，100Hz
+        self.dt = 0.01  # 仿真时间步长，100Hz，模拟真实世界的时间流逝
         self.max_episode_length = math.ceil(env_cfg["episode_length_s"] / self.dt)  # 最大回合步数
 
         # 保存配置
@@ -44,6 +50,7 @@ class HoverEnv:
         # ==================== 创建仿真场景 ====================
         self.scene = gs.Scene(
             sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),  # 每步2个子步骤
+            # 配置相机来录制视频
             viewer_options=gs.options.ViewerOptions(
                 max_FPS=env_cfg["max_visualize_FPS"],
                 camera_pos=(3.0, 0.0, 3.0),  # 相机位置
@@ -105,7 +112,7 @@ class HoverEnv:
         else:
             self.target = None
 
-        # 添加相机（用于渲染）
+        # 添加相机
         if self.env_cfg["visualize_camera"]:
             self.cam = self.scene.add_camera(
                 res=(1280, 720),
@@ -115,13 +122,13 @@ class HoverEnv:
                 GUI=True,
             )
 
-        # ==================== 添加无人机 ====================
+        # 添加无人机
         self.base_init_pos = torch.tensor(self.env_cfg["base_init_pos"], device=gs.device)  # 初始位置
         self.base_init_quat = torch.tensor(self.env_cfg["base_init_quat"], device=gs.device)  # 初始姿态四元数
         self.inv_base_init_quat = inv_quat(self.base_init_quat)  # 初始姿态的逆四元数
-        self.drone = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
+        self.drone = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf")) # 引入Genesis库中自带的无人机
 
-        # 构建场景（创建num_envs个并行环境）
+        # 多个并行环境
         self.scene.build(n_envs=num_envs)
 
         # ==================== 初始化奖励函数 ====================

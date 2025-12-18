@@ -25,6 +25,7 @@ import genesis as gs
 from hover_env import HoverEnv
 
 
+# 对于PPO算法模型训练的配置
 def get_train_cfg(exp_name, max_iterations):
     """
     获取PPO训练配置
@@ -82,7 +83,7 @@ def get_train_cfg(exp_name, max_iterations):
 
     return train_cfg_dict
 
-
+# cfgs--- configuration 配置的
 def get_cfgs():
     """
     获取环境、观测、奖励、指令配置
@@ -93,7 +94,7 @@ def get_cfgs():
         reward_cfg: 奖励函数配置
         command_cfg: 目标指令配置
     """
-    # 环境配置
+    # 无人机仿真环境的配置
     env_cfg = {
         "num_actions": 4,                        # 动作维度：4个电机转速
         # 终止条件
@@ -135,7 +136,7 @@ def get_cfgs():
         "obstacle_collision_distance": 0.18,  # 碰撞距离阈值(m)
     }
     
-    # 观测空间配置
+    # 观测空间配置，神经网络训练前的预处理工作
     obs_cfg = {
         "num_obs": 17,                # 观测维度
         "obs_scales": {
@@ -145,7 +146,7 @@ def get_cfgs():
         },
     }
     
-    # 奖励配置（针对复杂障碍物场景优化）
+    # 奖励配置
     reward_cfg = {
         "yaw_lambda": -5.0,           # 偏航角惩罚系数
         "reward_scales": {
@@ -173,7 +174,7 @@ def main():
     """
     主函数：解析参数 → 初始化Genesis → 创建环境 → 启动PPO训练
     """
-    # 解析命令行参数
+    # 执行命令的格式
     parser = argparse.ArgumentParser()
     parser.add_argument("-e", "--exp_name", type=str, default="drone-hovering")  # 实验名称
     parser.add_argument("-v", "--vis", action="store_true", default=False)       # 是否可视化
