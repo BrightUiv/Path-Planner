@@ -154,7 +154,12 @@ def main():
     parser.add_argument("--max_iterations", type=int, default=800)
     args = parser.parse_args()
 
-    gs.init(backend=gs.gpu, precision="32", logging_level="warning", performance_mode=True)
+    # 根据是否可视化选择不同的初始化方式
+    if args.vis:
+        gs.init(backend=gs.gpu, precision="32", logging_level="warning", performance_mode=True)
+    else:
+        # 无头模式：禁用渲染，避免 EGL/OpenGL 错误
+        gs.init(backend=gs.gpu, precision="32", logging_level="warning", performance_mode=True, vis_backend=None)
 
     log_dir = f"logs/{args.exp_name}"
     env_cfg, obs_cfg, reward_cfg, command_cfg = get_cfgs()

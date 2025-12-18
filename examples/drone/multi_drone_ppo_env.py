@@ -50,23 +50,37 @@ class MultiDronePPOEnv:
 
 
         # ==================== 创建仿真场景 ====================
-        self.scene = gs.Scene(
-            sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
-            viewer_options=gs.options.ViewerOptions(
-                max_FPS=env_cfg["max_visualize_FPS"],
-                camera_pos=(5.0, 0.0, 5.0),
-                camera_lookat=(0.0, 0.0, 1.0),
-                camera_fov=50,
-            ),
-            vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(self.rendered_env_num))),
-            rigid_options=gs.options.RigidOptions(
-                dt=self.dt,
-                constraint_solver=gs.constraint_solver.Newton,
-                enable_collision=True,
-                enable_joint_limit=True,
-            ),
-            show_viewer=show_viewer,
-        )
+        # 根据是否需要可视化来配置场景
+        if show_viewer:
+            self.scene = gs.Scene(
+                sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
+                viewer_options=gs.options.ViewerOptions(
+                    max_FPS=env_cfg["max_visualize_FPS"],
+                    camera_pos=(5.0, 0.0, 5.0),
+                    camera_lookat=(0.0, 0.0, 1.0),
+                    camera_fov=50,
+                ),
+                vis_options=gs.options.VisOptions(rendered_envs_idx=list(range(self.rendered_env_num))),
+                rigid_options=gs.options.RigidOptions(
+                    dt=self.dt,
+                    constraint_solver=gs.constraint_solver.Newton,
+                    enable_collision=True,
+                    enable_joint_limit=True,
+                ),
+                show_viewer=True,
+            )
+        else:
+            # 无头模式：禁用所有可视化，避免 EGL/OpenGL 错误
+            self.scene = gs.Scene(
+                sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
+                rigid_options=gs.options.RigidOptions(
+                    dt=self.dt,
+                    constraint_solver=gs.constraint_solver.Newton,
+                    enable_collision=True,
+                    enable_joint_limit=True,
+                ),
+                show_viewer=False,
+            )
 
         self.scene.add_entity(gs.morphs.Plane())
 
@@ -77,15 +91,21 @@ class MultiDronePPOEnv:
         obstacle_height = env_cfg.get("obstacle_height", 2.5)
         
         for pos in obstacle_positions:
-            obstacle = self.scene.add_entity(
-                morph=gs.morphs.Cylinder(
-                    pos=pos, radius=obstacle_radius, height=obstacle_height,
-                    fixed=True, collision=True,
-                ),
-                surface=gs.surfaces.Rough(
-                    diffuse_texture=gs.textures.ColorTexture(color=(0.3, 0.3, 0.8)),
-                ),
-            )
+            if show_viewer:
+                obstacle = self.scene.add_entity(
+                    morph=gs.morphs.Cylinder(
+                        pos=pos,
+                        radius=obstacle_radius,
+                        height=obstacle_height,
+                        fixed=True,
+                        collision=True,
+                    ),
+                    surface=gs.surfaces.Rough(
+                        diffuse_texture=gs.textures.ColorTexture(color=(0.3, 0.3, 0.8)),
+                    ),
+                )
+            else:
+                obstacle = None
             self.obstacles.append({
                 "entity": obstacle,
                 "pos": torch.tensor(pos, device=gs.device),
@@ -128,8 +148,19 @@ class MultiDronePPOEnv:
                 )
                 self.targets.append(target)
 
-        self.scene.build(n_envs=num_envs)
+        # ==================== 添加录制相机（必须在 build 之前）====================
+        if env_cfg.get("visualize_camera", False):
+            self.cam = self.scene.add_camera(
+                res=(1280, 720),
+                pos=(5.0, 0.0, 5.0),
+                lookat=(0.0, 0.0, 1.0),
+                fov=50,
+                GUI=False,
+            )
+        else:
+            self.cam = None
 
+        self.scene.build(n_envs=num_envs)
 
         # ==================== 初始化奖励函数 ====================
         self.reward_functions, self.episode_sums = dict(), dict()
