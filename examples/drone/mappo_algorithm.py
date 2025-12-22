@@ -26,38 +26,42 @@ class MAPPOActor(nn.Module):
             ])
             prev_dim = hidden_dim
         
-        self.backbone = nn.Sequential(*layers)
-        self.mean_head = nn.Linear(prev_dim, action_dim)
+        self.backbone = nn.Sequential(*layers) #神经网络的躯干部分
+        self.mean_head = nn.Linear(prev_dim, action_dim) #最后一个hidden dim，连接上四个电机的信息
         # 可学习的log_std，初始值较大以鼓励探索 
         self.log_std = nn.Parameter(torch.ones(action_dim) * np.log(init_std))
         
         # 初始化
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2)) #正交初始化权重
                 nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.mean_head.weight, gain=0.1)
-        nn.init.zeros_(self.mean_head.bias)
+        nn.init.orthogonal_(self.mean_head.weight, gain=0.1) # 输出层的权重
+        nn.init.zeros_(self.mean_head.bias) # 输出层的权重偏执设置
     
+    # 输出均值与标准差
     def forward(self, obs):
-        features = self.backbone(obs)
+        features = self.backbone(obs) #使用神经网络的躯干部分
         # 使用tanh限制输出范围到[-1, 1]
         mean = torch.tanh(self.mean_head(features))
         # std可学习，范围更宽以允许更多探索
         std = torch.clamp(self.log_std.exp(), min=0.1, max=1.0).expand_as(mean)
         return mean, std
     
+    # 获得无人机具体的动作方向
     def get_action(self, obs, deterministic=False):
-        mean, std = self.forward(obs)
-        if deterministic:
+        mean, std = self.forward(obs)  # 获取参数分布
+        if deterministic: # 评估时，直接使用均值，不使用波动性
             return mean, torch.zeros(obs.shape[0], device=obs.device)
-        dist = Normal(mean, std)
+        dist = Normal(mean, std) # 基于神经网络创建高斯正态分布的对象
         # 采样后也要clamp到有效范围
-        action = torch.clamp(dist.sample(), -1.0, 1.0)
+        action = torch.clamp(dist.sample(), -1.0, 1.0) # 采样并且限制范围
         # 计算log_prob时使用原始采样值（在clamp之前）
         log_prob = dist.log_prob(action).sum(dim=-1)
         return action, log_prob
     
+
+    # 
     def evaluate_actions(self, obs, actions):
         mean, std = self.forward(obs)
         dist = Normal(mean, std)
@@ -218,7 +222,7 @@ class MAPPO:
         self.batch_size = batch_size
         self.share_actor = share_actor
         
-        # 创建网络
+        # 创建网络，Critic和Actor神经网络
         actor_hidden = [256, 256, 128]
         critic_hidden = [512, 256, 128]
         
