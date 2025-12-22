@@ -1,6 +1,6 @@
 """
-MAPPO (Multi-Agent PPO) 算法实现
-核心思想：集中式训练（Centralized Critic）+ 分布式执行（Decentralized Actor）
+- Actor: 每个智能体根据局部观测独立决策
+- Critic: 使用全局状态信息评估联合价值函数
 """
 import torch
 import torch.nn as nn
@@ -10,72 +10,85 @@ import numpy as np
 
 
 class MAPPOActor(nn.Module):
-    """分布式Actor网络 - 每个智能体独立决策"""
+    """
+    分布式Actor网络 - 每个智能体独立决策
+    输入: 单个智能体的局部观测
+    输出: 动作的均值和标准差（高斯策略）
+    """
     
     def __init__(self, obs_dim, action_dim, hidden_dims=[256, 256], init_std=0.5):
         super().__init__()
         
         self.action_dim = action_dim
         
+        # 构建MLP骨干网络
         layers = []
         prev_dim = obs_dim
         for hidden_dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
-                nn.ELU(),
+                nn.ELU(),  # ELU激活函数，比ReLU更平滑
             ])
             prev_dim = hidden_dim
         
-        self.backbone = nn.Sequential(*layers) #神经网络的躯干部分
-        self.mean_head = nn.Linear(prev_dim, action_dim) #最后一个hidden dim，连接上四个电机的信息
-        # 可学习的log_std，初始值较大以鼓励探索 
+        self.backbone = nn.Sequential(*layers)  # 特征提取网络
+        self.mean_head = nn.Linear(prev_dim, action_dim)  # 输出动作均值
+        # 可学习的log标准差，初始值较大以鼓励早期探索
         self.log_std = nn.Parameter(torch.ones(action_dim) * np.log(init_std))
         
-        # 初始化
+        # 正交初始化：有助于训练稳定性
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.orthogonal_(m.weight, gain=np.sqrt(2)) #正交初始化权重
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.zeros_(m.bias)
-        nn.init.orthogonal_(self.mean_head.weight, gain=0.1) # 输出层的权重
-        nn.init.zeros_(self.mean_head.bias) # 输出层的权重偏执设置
+        # 输出层使用较小的增益，使初始输出接近零
+        nn.init.orthogonal_(self.mean_head.weight, gain=0.1)
+        nn.init.zeros_(self.mean_head.bias)
     
-    # 输出均值与标准差
     def forward(self, obs):
-        features = self.backbone(obs) #使用神经网络的躯干部分
-        # 使用tanh限制输出范围到[-1, 1]
+        """前向传播，输出动作分布参数"""
+        features = self.backbone(obs)
+        # tanh将均值限制在[-1, 1]范围内
         mean = torch.tanh(self.mean_head(features))
-        # std可学习，范围更宽以允许更多探索
+        # 标准差限制在[0.1, 1.0]，防止过小（确定性）或过大（随机）
         std = torch.clamp(self.log_std.exp(), min=0.1, max=1.0).expand_as(mean)
         return mean, std
     
-    # 获得无人机具体的动作方向
     def get_action(self, obs, deterministic=False):
-        mean, std = self.forward(obs)  # 获取参数分布
-        if deterministic: # 评估时，直接使用均值，不使用波动性
+        """
+        采样动作
+        deterministic=True: 评估时直接使用均值
+        deterministic=False: 训练时从高斯分布采样
+        """
+        mean, std = self.forward(obs)
+        if deterministic:
             return mean, torch.zeros(obs.shape[0], device=obs.device)
-        dist = Normal(mean, std) # 基于神经网络创建高斯正态分布的对象
-        # 采样后也要clamp到有效范围
-        action = torch.clamp(dist.sample(), -1.0, 1.0) # 采样并且限制范围
-        # 计算log_prob时使用原始采样值（在clamp之前）
-        log_prob = dist.log_prob(action).sum(dim=-1)
+        
+        dist = Normal(mean, std)  # 构建高斯分布
+        action = torch.clamp(dist.sample(), -1.0, 1.0)  # 采样并裁剪
+        log_prob = dist.log_prob(action).sum(dim=-1)  # 计算对数概率
         return action, log_prob
     
-
-    # 
     def evaluate_actions(self, obs, actions):
+        """评估给定动作的对数概率和熵（用于PPO更新）"""
         mean, std = self.forward(obs)
         dist = Normal(mean, std)
         log_prob = dist.log_prob(actions).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
+        entropy = dist.entropy().sum(dim=-1)  # 熵用于鼓励探索
         return log_prob, entropy
 
 
 class MAPPOCritic(nn.Module):
-    """集中式Critic网络 - 使用全局状态评估价值"""
+    """
+    集中式Critic网络 - 使用全局状态评估价值
+    输入: 所有智能体的联合观测（全局状态）
+    输出: 状态价值V(s)
+    """
     
     def __init__(self, global_obs_dim, hidden_dims=[512, 512, 256]):
         super().__init__()
         
+        # 构建价值网络
         layers = []
         prev_dim = global_obs_dim
         for hidden_dim in hidden_dims:
@@ -84,50 +97,47 @@ class MAPPOCritic(nn.Module):
                 nn.ELU(),
             ])
             prev_dim = hidden_dim
-        layers.append(nn.Linear(prev_dim, 1))
+        layers.append(nn.Linear(prev_dim, 1))  # 输出单一价值
         
         self.network = nn.Sequential(*layers)
         
-        # 初始化
+        # 正交初始化
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
                 nn.init.zeros_(m.bias)
     
     def forward(self, global_obs):
+        """输出状态价值"""
         return self.network(global_obs).squeeze(-1)
 
 
 class MAPPOBuffer:
-    """MAPPO经验回放缓冲区"""
+    """
+    MAPPO经验回放缓冲区
+    存储轨迹数据用于PPO更新
+    """
     
     def __init__(self, num_envs, num_agents, num_steps, obs_dim, global_obs_dim, action_dim, device):
         self.num_envs = num_envs
         self.num_agents = num_agents
         self.num_steps = num_steps
         self.device = device
-        self.ptr = 0
+        self.ptr = 0  # 当前写入位置
         
-        # 每个智能体的局部观测 [steps, envs, agents, obs_dim]
-        self.obs = torch.zeros((num_steps, num_envs, num_agents, obs_dim), device=device)
-        # 全局观测 [steps, envs, global_obs_dim]
-        self.global_obs = torch.zeros((num_steps, num_envs, global_obs_dim), device=device)
-        # 动作 [steps, envs, agents, action_dim]
-        self.actions = torch.zeros((num_steps, num_envs, num_agents, action_dim), device=device)
-        # 对数概率 [steps, envs, agents]
-        self.log_probs = torch.zeros((num_steps, num_envs, num_agents), device=device)
-        # 奖励 [steps, envs] - 共享奖励
-        self.rewards = torch.zeros((num_steps, num_envs), device=device)
-        # 终止标志 [steps, envs]
-        self.dones = torch.zeros((num_steps, num_envs), device=device)
-        # 价值估计 [steps, envs]
-        self.values = torch.zeros((num_steps, num_envs), device=device)
-        # GAE优势 [steps, envs]
-        self.advantages = torch.zeros((num_steps, num_envs), device=device)
-        # 回报 [steps, envs]
-        self.returns = torch.zeros((num_steps, num_envs), device=device)
+        # 预分配存储空间
+        self.obs = torch.zeros((num_steps, num_envs, num_agents, obs_dim), device=device)  # 局部观测
+        self.global_obs = torch.zeros((num_steps, num_envs, global_obs_dim), device=device)  # 全局观测
+        self.actions = torch.zeros((num_steps, num_envs, num_agents, action_dim), device=device)  # 动作
+        self.log_probs = torch.zeros((num_steps, num_envs, num_agents), device=device)  # 动作对数概率
+        self.rewards = torch.zeros((num_steps, num_envs), device=device)  # 共享奖励
+        self.dones = torch.zeros((num_steps, num_envs), device=device)  # 终止标志
+        self.values = torch.zeros((num_steps, num_envs), device=device)  # 价值估计
+        self.advantages = torch.zeros((num_steps, num_envs), device=device)  # GAE优势
+        self.returns = torch.zeros((num_steps, num_envs), device=device)  # 回报
     
     def store(self, obs, global_obs, actions, log_probs, rewards, dones, values):
+        """存储一步转移数据"""
         self.obs[self.ptr] = obs
         self.global_obs[self.ptr] = global_obs
         self.actions[self.ptr] = actions
@@ -138,28 +148,35 @@ class MAPPOBuffer:
         self.ptr = (self.ptr + 1) % self.num_steps
     
     def compute_gae(self, last_value, gamma=0.99, lam=0.95):
-        """计算GAE优势估计"""
+        """
+        计算GAE (Generalized Advantage Estimation)
+        GAE平衡了偏差和方差，是PPO的关键组件
+        gamma: 折扣因子
+        lam: GAE平滑参数
+        """
         gae = torch.zeros((self.num_envs,), device=self.device)
         
+        # 从后向前计算GAE
         for t in reversed(range(self.num_steps)):
             if t == self.num_steps - 1:
                 next_value = last_value
-                next_non_terminal = 1.0 - self.dones[t]
             else:
                 next_value = self.values[t + 1]
-                next_non_terminal = 1.0 - self.dones[t]
+            next_non_terminal = 1.0 - self.dones[t]
             
+            # TD误差: δ = r + γV(s') - V(s)
             delta = self.rewards[t] + gamma * next_value * next_non_terminal - self.values[t]
+            # GAE递推: A_t = δ_t + γλA_{t+1}
             gae = delta + gamma * lam * next_non_terminal * gae
             self.advantages[t] = gae
-            self.returns[t] = gae + self.values[t]
+            self.returns[t] = gae + self.values[t]  # 回报 = 优势 + 价值
         
-        # 标准化优势（按环境维度展平后标准化）
+        # 标准化优势，稳定训练
         adv_flat = self.advantages.view(-1)
-        self.advantages = ((self.advantages - adv_flat.mean()) / (adv_flat.std() + 1e-8))
+        self.advantages = (self.advantages - adv_flat.mean()) / (adv_flat.std() + 1e-8)
     
     def get_batches(self, batch_size):
-        """生成训练批次"""
+        """生成随机小批量用于训练"""
         total_samples = self.num_steps * self.num_envs
         indices = torch.randperm(total_samples, device=self.device)
         
@@ -167,25 +184,26 @@ class MAPPOBuffer:
             end = min(start + batch_size, total_samples)
             batch_indices = indices[start:end]
             
-            # 转换索引
+            # 将一维索引转换为二维索引
             step_idx = batch_indices // self.num_envs
             env_idx = batch_indices % self.num_envs
             
             yield {
-                'obs': self.obs[step_idx, env_idx],           # [batch, agents, obs_dim]
-                'global_obs': self.global_obs[step_idx, env_idx],  # [batch, global_obs_dim]
-                'actions': self.actions[step_idx, env_idx],   # [batch, agents, action_dim]
-                'log_probs': self.log_probs[step_idx, env_idx],  # [batch, agents]
-                'advantages': self.advantages[step_idx, env_idx],  # [batch]
-                'returns': self.returns[step_idx, env_idx],   # [batch]
+                'obs': self.obs[step_idx, env_idx],
+                'global_obs': self.global_obs[step_idx, env_idx],
+                'actions': self.actions[step_idx, env_idx],
+                'log_probs': self.log_probs[step_idx, env_idx],
+                'advantages': self.advantages[step_idx, env_idx],
+                'returns': self.returns[step_idx, env_idx],
             }
     
     def clear(self):
+        """重置缓冲区指针"""
         self.ptr = 0
 
 
 class MAPPO:
-    """MAPPO算法主类"""
+    """MAPPO算法主类，整合Actor、Critic和训练逻辑"""
     
     def __init__(
         self,
@@ -194,17 +212,17 @@ class MAPPO:
         global_obs_dim,
         action_dim,
         device,
-        lr_actor=3e-4,      # 提高学习率，加速学习
-        lr_critic=5e-4,
-        gamma=0.99,
-        lam=0.95,
-        clip_param=0.2,
-        entropy_coef=0.02,   # 提高熵系数，增加探索
-        value_loss_coef=0.5,
-        max_grad_norm=1.0,   # 放宽梯度裁剪
-        num_epochs=5,        # 减少epoch，避免过拟合
-        batch_size=512,
-        share_actor=True,  # 是否共享Actor参数
+        lr_actor=3e-4,       # Actor学习率
+        lr_critic=5e-4,      # Critic学习率（通常略高）
+        gamma=0.99,          # 折扣因子
+        lam=0.95,            # GAE参数
+        clip_param=0.2,      # PPO裁剪范围
+        entropy_coef=0.02,   # 熵正则化系数（鼓励探索）
+        value_loss_coef=0.5, # 价值损失权重
+        max_grad_norm=1.0,   # 梯度裁剪阈值
+        num_epochs=5,        # 每次更新的epoch数
+        batch_size=512,      # 小批量大小
+        share_actor=True,    # 是否共享Actor参数（同质智能体）
     ):
         self.num_agents = num_agents
         self.obs_dim = obs_dim
@@ -212,6 +230,7 @@ class MAPPO:
         self.action_dim = action_dim
         self.device = device
         
+        # 保存超参数
         self.gamma = gamma
         self.lam = lam
         self.clip_param = clip_param
@@ -222,22 +241,24 @@ class MAPPO:
         self.batch_size = batch_size
         self.share_actor = share_actor
         
-        # 创建网络，Critic和Actor神经网络
+        # 网络结构配置
         actor_hidden = [256, 256, 128]
         critic_hidden = [512, 256, 128]
         
+        # 创建Actor网络
         if share_actor:
-            # 共享Actor参数（同质智能体）
+            # 参数共享：所有智能体使用同一个Actor（适用于同质智能体）
             self.actor = MAPPOActor(obs_dim, action_dim, hidden_dims=actor_hidden, init_std=0.5).to(device)
             self.actors = [self.actor] * num_agents
         else:
-            # 独立Actor（异质智能体）
-            self.actors = [MAPPOActor(obs_dim, action_dim, hidden_dims=actor_hidden, init_std=0.5).to(device) for _ in range(num_agents)]
+            # 独立Actor：每个智能体有自己的策略（适用于异质智能体）
+            self.actors = [MAPPOActor(obs_dim, action_dim, hidden_dims=actor_hidden, init_std=0.5).to(device) 
+                          for _ in range(num_agents)]
         
-        # 集中式Critic
+        # 创建集中式Critic（所有智能体共享）
         self.critic = MAPPOCritic(global_obs_dim, hidden_dims=critic_hidden).to(device)
         
-        # 优化器
+        # 配置优化器
         if share_actor:
             self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
         else:
@@ -252,14 +273,15 @@ class MAPPO:
         """
         获取所有智能体的动作
         obs: [num_envs, num_agents, obs_dim]
-        返回: actions [num_envs, num_agents, action_dim], log_probs [num_envs, num_agents]
+        返回: actions, log_probs
         """
         num_envs = obs.shape[0]
         actions = torch.zeros((num_envs, self.num_agents, self.action_dim), device=self.device)
         log_probs = torch.zeros((num_envs, self.num_agents), device=self.device)
         
+        # 每个智能体独立决策
         for i, actor in enumerate(self.actors):
-            agent_obs = obs[:, i, :]  # [num_envs, obs_dim]
+            agent_obs = obs[:, i, :]
             act, lp = actor.get_action(agent_obs, deterministic=deterministic)
             actions[:, i, :] = act
             log_probs[:, i] = lp
@@ -267,11 +289,16 @@ class MAPPO:
         return actions, log_probs
     
     def get_value(self, global_obs):
-        """获取全局状态价值"""
+        """使用Critic评估全局状态价值"""
         return self.critic(global_obs)
     
     def update(self, buffer):
-        """更新网络参数"""
+        """
+        PPO更新步骤
+        1. 计算GAE优势
+        2. 多轮epoch更新Actor和Critic
+        """
+        # 计算GAE
         buffer.compute_gae(
             self.get_value(buffer.global_obs[-1]).detach(),
             self.gamma,
@@ -283,19 +310,21 @@ class MAPPO:
         total_entropy = 0
         num_updates = 0
         
+        # 多轮epoch更新
         for _ in range(self.num_epochs):
             for batch in buffer.get_batches(self.batch_size):
-                obs = batch['obs']              # [batch, agents, obs_dim]
-                global_obs = batch['global_obs']  # [batch, global_obs_dim]
-                actions = batch['actions']      # [batch, agents, action_dim]
-                old_log_probs = batch['log_probs']  # [batch, agents]
-                advantages = batch['advantages']  # [batch]
-                returns = batch['returns']      # [batch]
+                obs = batch['obs']
+                global_obs = batch['global_obs']
+                actions = batch['actions']
+                old_log_probs = batch['log_probs']
+                advantages = batch['advantages']
+                returns = batch['returns']
                 
-                # ========== 更新Actor ==========
+                # ========== Actor更新 ==========
                 new_log_probs = torch.zeros_like(old_log_probs)
                 entropy = torch.zeros_like(old_log_probs)
                 
+                # 计算新策略下的对数概率
                 for i, actor in enumerate(self.actors):
                     agent_obs = obs[:, i, :]
                     agent_actions = actions[:, i, :]
@@ -303,20 +332,21 @@ class MAPPO:
                     new_log_probs[:, i] = lp
                     entropy[:, i] = ent
                 
-                # 计算比率（所有智能体的联合比率）
+                # 计算重要性采样比率（联合策略）
                 ratio = torch.exp(new_log_probs.sum(dim=-1) - old_log_probs.sum(dim=-1))
                 
-                # PPO裁剪目标
+                # PPO-Clip目标函数
                 surr1 = ratio * advantages
                 surr2 = torch.clamp(ratio, 1 - self.clip_param, 1 + self.clip_param) * advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
                 
-                # 熵奖励
+                # 熵正则化（鼓励探索）
                 entropy_loss = -entropy.mean()
                 
                 # Actor总损失
                 total_actor_loss_batch = actor_loss + self.entropy_coef * entropy_loss
                 
+                # 反向传播和梯度更新
                 self.actor_optimizer.zero_grad()
                 total_actor_loss_batch.backward()
                 if self.share_actor:
@@ -326,8 +356,9 @@ class MAPPO:
                         nn.utils.clip_grad_norm_(actor.parameters(), self.max_grad_norm)
                 self.actor_optimizer.step()
                 
-                # ========== 更新Critic ==========
+                # ========== Critic更新 ==========
                 values = self.critic(global_obs)
+                # MSE损失
                 critic_loss = self.value_loss_coef * ((values - returns) ** 2).mean()
                 
                 self.critic_optimizer.zero_grad()
@@ -335,6 +366,7 @@ class MAPPO:
                 nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 self.critic_optimizer.step()
                 
+                # 记录统计信息
                 total_actor_loss += actor_loss.item()
                 total_critic_loss += critic_loss.item()
                 total_entropy += entropy.mean().item()
@@ -349,10 +381,8 @@ class MAPPO:
         }
     
     def save(self, path):
-        """保存模型"""
-        state = {
-            'critic': self.critic.state_dict(),
-        }
+        """保存模型参数"""
+        state = {'critic': self.critic.state_dict()}
         if self.share_actor:
             state['actor'] = self.actor.state_dict()
         else:
@@ -361,7 +391,7 @@ class MAPPO:
         torch.save(state, path)
     
     def load(self, path):
-        """加载模型"""
+        """加载模型参数"""
         state = torch.load(path, map_location=self.device)
         self.critic.load_state_dict(state['critic'])
         if self.share_actor:

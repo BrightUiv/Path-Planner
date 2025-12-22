@@ -54,11 +54,11 @@ class MultiDroneMAPPOEnv:
         self.rendered_env_num = min(5, self.num_envs)
         
         # MAPPO关键：每个智能体独立的观测和动作维度
-        # 单架无人机局部观测：相对位置(3) + 四元数(4) + 线速度(3) + 角速度(3) + 上一步动作(4) = 17维
-        self.num_obs_per_agent = obs_cfg.get("num_obs_per_agent", 17)
-        # 其他无人机相对位置信息：(num_drones-1) * 3 = 6维（可选，用于增强局部观测）
+        # 单架无人机局部观测：智能体ID(3) + 相对位置(3)+四元数(4)+线速度(3)+角速度(3)+动作(4) = 20维
+        self.num_obs_per_agent = obs_cfg.get("num_obs_per_agent", 20)
+        # 其他无人机相对位置信息：(num_drones-1) * 3 = 6维
         self.num_other_agents_obs = (self.num_drones - 1) * 3
-        # 完整局部观测维度：17 + 6 = 23维
+        # 完整局部观测维度：20 + 6 = 26维
         self.num_obs = self.num_obs_per_agent + self.num_other_agents_obs
         # 全局状态维度（Critic使用）：所有无人机状态拼接
         self.num_state = self.num_obs * self.num_drones
@@ -103,7 +103,7 @@ class MultiDroneMAPPOEnv:
                 show_viewer=True,
             )
         else:
-            # 无头模式：禁用所有可视化，避免 EGL/OpenGL 错误
+            # 无头模式：完全禁用可视化，避免 EGL/OpenGL 错误
             self.scene = gs.Scene(
                 sim_options=gs.options.SimOptions(dt=self.dt, substeps=2),
                 rigid_options=gs.options.RigidOptions(
@@ -113,6 +113,7 @@ class MultiDroneMAPPOEnv:
                     enable_joint_limit=True,
                 ),
                 show_viewer=False,
+                show_FPS=False,
             )
 
         self.scene.add_entity(gs.morphs.Plane())
@@ -122,8 +123,9 @@ class MultiDroneMAPPOEnv:
         obstacle_positions = env_cfg.get("obstacle_positions", [])
         obstacle_radius = env_cfg.get("obstacle_radius", 0.12)
         obstacle_height = env_cfg.get("obstacle_height", 2.5)
-        
+
         for pos in obstacle_positions:
+            # 无论是否可视化，都添加障碍物实体（用于碰撞检测）
             if show_viewer:
                 obstacle = self.scene.add_entity(
                     morph=gs.morphs.Cylinder(
@@ -138,7 +140,16 @@ class MultiDroneMAPPOEnv:
                     ),
                 )
             else:
-                obstacle = None
+                # 无头模式也添加障碍物，但不设置表面材质
+                obstacle = self.scene.add_entity(
+                    morph=gs.morphs.Cylinder(
+                        pos=pos,
+                        radius=obstacle_radius,
+                        height=obstacle_height,
+                        fixed=True,
+                        collision=True,
+                    ),
+                )
             self.obstacles.append({
                 "entity": obstacle,
                 "pos": torch.tensor(pos, device=gs.device),
@@ -158,17 +169,19 @@ class MultiDroneMAPPOEnv:
             [-1.0, 2.5, 0.15], [0.0, 2.5, 0.15], [1.0, 2.5, 0.15],
         ])
         
-        drone_colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.2, 1.0)]
+        drone_colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.2, 1.0)]  # RGB: 红、绿、蓝
+        # 初始四元数 [w,x,y,z]=[1,0,0,0] 表示无旋转（单位四元数）
         self.base_init_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=gs.device)
-        self.inv_base_init_quat = inv_quat(self.base_init_quat)
+        self.inv_base_init_quat = inv_quat(self.base_init_quat)  # 逆四元数，用于坐标变换
         
         for i in range(self.num_drones):
+            # 加载Crazyflie 2.x四旋翼无人机URDF模型
             drone = self.scene.add_entity(gs.morphs.Drone(file="urdf/drones/cf2x.urdf"))
             self.drones.append(drone)
 
-        # 目标点可视化
+        # 目标点可视化（仅在可视化模式下）
         self.targets = []
-        if env_cfg.get("visualize_target", False):
+        if show_viewer and env_cfg.get("visualize_target", False):
             for i, goal_pos in enumerate(self.drone_goal_positions):
                 target = self.scene.add_entity(
                     morph=gs.morphs.Mesh(
@@ -181,8 +194,9 @@ class MultiDroneMAPPOEnv:
                 )
                 self.targets.append(target)
 
-        # ==================== 添加录制相机（必须在 build 之前）====================
-        if env_cfg.get("visualize_camera", False):
+        # ==================== 添加录制相机（仅在可视化模式下）====================
+        self.cam = None
+        if show_viewer and env_cfg.get("visualize_camera", False):
             self.cam = self.scene.add_camera(
                 res=(1280, 720),
                 pos=(5.0, 0.0, 5.0),
@@ -190,8 +204,6 @@ class MultiDroneMAPPOEnv:
                 fov=50,
                 GUI=False,
             )
-        else:
-            self.cam = None
 
         self.scene.build(n_envs=num_envs)
 
@@ -268,6 +280,8 @@ class MultiDroneMAPPOEnv:
         # 为每架无人机设置动作（将动作转换为螺旋桨转速）
         for i, drone in enumerate(self.drones):
             drone_actions = self.actions[:, i, :]  # (num_envs, num_actions)
+            # 动作映射：[-1,1] -> [0.2, 1.8] * 悬停转速 = [2894, 26043] RPM
+            # 14468.429... 是Crazyflie 2.x的悬停转速（hover RPM）
             drone.set_propellels_rpm((1 + drone_actions * 0.8) * 14468.429183500699)
 
         self.scene.step()
@@ -325,12 +339,13 @@ class MultiDroneMAPPOEnv:
             self.agent_success[:, i] = drone_success
             success_all = success_all & drone_success
 
-        # 检测无人机之间是否发生碰撞
+        # 检测无人机之间是否发生碰撞（任意两架距离小于阈值）
         drone_collision = self.min_drone_dist < self.env_cfg.get("drone_collision_distance", 0.3)
         crash_any = crash_any | drone_collision
 
-        self.crash_condition = crash_any
-        self.success_condition = success_all
+        self.crash_condition = crash_any      # 任一无人机坠毁/碰撞
+        self.success_condition = success_all  # 所有无人机都到达目标
+        # 重置条件：超时 或 坠毁 或 全部成功
         self.reset_buf = (self.episode_length_buf > self.max_episode_length) | crash_any | success_all
 
         self.reset_idx(self.reset_buf.nonzero(as_tuple=False).reshape((-1,)))
@@ -360,22 +375,28 @@ class MultiDroneMAPPOEnv:
         计算每个智能体的局部观测和全局状态
         
         局部观测（每个智能体）：
+            - 智能体ID (one-hot编码, 3维)
             - 到目标的相对位置 (3维)
             - 姿态四元数 (4维)
             - 线速度 (3维)
             - 角速度 (3维)
             - 上一步动作 (4维)
             - 其他无人机的相对位置 (6维)
-            总计：23维
+            总计：26维
         
         全局状态（Critic使用）：
             - 所有智能体的局部观测拼接
-            总计：23 * 3 = 69维
+            总计：26 * 3 = 78维
         """
         obs_list = []
         for i in range(self.num_agents):
+            # 智能体ID (one-hot编码)：3维 - 让共享Actor能区分不同无人机
+            agent_id = torch.zeros((self.num_envs, self.num_agents), device=gs.device, dtype=gs.tc_float)
+            agent_id[:, i] = 1.0
+            
             # 基础局部观测：17维
             base_obs = torch.cat([
+                agent_id,  # 3维 - 智能体身份标识
                 torch.clip(self.rel_pos[:, i, :] * self.obs_scales["rel_pos"], -1, 1),  # 3
                 self.base_quat[:, i, :],  # 4
                 torch.clip(self.base_lin_vel[:, i, :] * self.obs_scales["lin_vel"], -1, 1),  # 3
@@ -390,20 +411,20 @@ class MultiDroneMAPPOEnv:
                     rel_to_other = (self.base_pos[:, j, :] - self.base_pos[:, i, :]) * self.obs_scales["rel_pos"]
                     other_agents_rel_pos.append(torch.clip(rel_to_other, -1, 1))
             
-            # 拼接单个智能体的完整局部观测：17 + 6 = 23维
+            # 拼接单个智能体的完整局部观测：20 + 6 = 26维
             agent_obs = torch.cat([base_obs] + other_agents_rel_pos, dim=-1)
             self.obs_buf[:, i, :] = agent_obs
             obs_list.append(agent_obs)
         
-        # 全局状态：所有智能体观测拼接，23 * 3 = 69维
+        # 全局状态：所有智能体观测拼接，26 * 3 = 78维
         self.state_buf = torch.cat(obs_list, dim=-1)
 
     def _get_min_obstacle_distance(self):
         """
-        计算每架无人机与障碍物的最小距离
+        计算每架无人机与障碍物的最小距离（仅考虑XY平面，忽略高度）
         
         返回:
-            min_dist: 形状为 (num_envs, num_drones) 的张量
+            min_dist: 形状为 (num_envs, num_drones) 的张量，表示到最近障碍物边缘的距离
         """
         min_dist = torch.ones((self.num_envs, self.num_drones), device=gs.device, dtype=gs.tc_float) * 100.0
         if len(self.obstacles) == 0:
@@ -412,18 +433,20 @@ class MultiDroneMAPPOEnv:
             drone_pos_xy = self.base_pos[:, i, :2]
             for obs in self.obstacles:
                 obs_pos_xy = obs["pos"][:2].unsqueeze(0)
+                # 计算XY平面距离并减去障碍物半径，得到到障碍物边缘的距离
                 dist = torch.norm(drone_pos_xy - obs_pos_xy, dim=1) - obs["radius"]
                 min_dist[:, i] = torch.minimum(min_dist[:, i], dist)
         return min_dist
 
     def _get_min_drone_distance(self):
         """
-        计算无人机之间的最小距离
+        计算无人机之间的最小距离（3D欧氏距离）
         
         返回:
-            min_dist: 形状为 (num_envs,) 的张量
+            min_dist: 形状为 (num_envs,) 的张量，表示所有无人机对中的最小距离
         """
         min_dist = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float) * 100.0
+        # 遍历所有无人机对 (i,j)，其中 i < j，避免重复计算
         for i in range(self.num_drones):
             for j in range(i + 1, self.num_drones):
                 dist = torch.norm(self.base_pos[:, i, :] - self.base_pos[:, j, :], dim=1)
@@ -528,15 +551,16 @@ class MultiDroneMAPPOEnv:
             curr_dist = torch.norm(self.rel_pos[:, i, :], dim=1)
             last_dist = torch.norm(self.last_rel_pos[:, i, :], dim=1)
             
-            # 距离缩减奖励
+            # 距离缩减奖励：鼓励向目标移动（正向激励）
             dist_reduction = last_dist - curr_dist
             target_rew[:, i] += dist_reduction * 10.0
-            # 距离惩罚
+            # 距离惩罚：距离越远惩罚越大（持续压力）
             target_rew[:, i] -= curr_dist * 0.1
-            # 接近奖励
+            # 接近奖励：进入2m范围给额外奖励
             target_rew[:, i] += torch.where(curr_dist < 2.0, torch.ones_like(curr_dist) * 2.0, torch.zeros_like(curr_dist))
+            # 接近奖励：进入1m范围给更大奖励
             target_rew[:, i] += torch.where(curr_dist < 1.0, torch.ones_like(curr_dist) * 5.0, torch.zeros_like(curr_dist))
-            # 到达目标奖励
+            # 到达目标奖励：成功到达给大额奖励
             target_rew[self.agent_success[:, i], i] += 50.0
         
         # 全部成功的团队奖励（所有智能体共享）
@@ -545,11 +569,12 @@ class MultiDroneMAPPOEnv:
 
     def _reward_smooth(self):
         """
-        平滑奖励：惩罚每个智能体动作的剧烈变化
+        平滑奖励：惩罚每个智能体动作的剧烈变化（L2范数）
         
         返回:
             smooth_rew: 形状为 (num_envs, num_agents) 的奖励张量
         """
+        # 计算相邻帧动作差的平方和，值越大表示动作越抖动
         return torch.sum(torch.square(self.actions - self.last_actions), dim=-1)
 
     def _reward_crash(self):
@@ -621,13 +646,22 @@ class MultiDroneMAPPOEnv:
     
     def _reward_alive(self):
         """
-        存活奖励：鼓励每个智能体保持飞行状态
+        存活奖励：鼓励每个智能体保持飞行状态，并惩罚原地不动
         
         返回:
             alive_rew: 形状为 (num_envs, num_agents) 的奖励张量
         """
         alive_rew = torch.ones((self.num_envs, self.num_agents), device=gs.device, dtype=gs.tc_float)
         alive_rew[self.agent_crash] = 0
+        
+        # 惩罚原地不动：如果速度太低且距离目标还远，给予惩罚
+        for i in range(self.num_agents):
+            speed = torch.norm(self.base_lin_vel[:, i, :], dim=1)
+            dist_to_target = torch.norm(self.rel_pos[:, i, :], dim=1)
+            # 如果速度小于0.1且距离目标大于1m，惩罚
+            lazy_mask = (speed < 0.1) & (dist_to_target > 1.0)
+            alive_rew[lazy_mask, i] -= 0.5
+        
         return alive_rew
 
     # ==================== MAPPO特有接口 ====================
