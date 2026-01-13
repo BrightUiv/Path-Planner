@@ -40,12 +40,94 @@ from genesis.recorders import RecorderManager
 from genesis.repr_base import RBC
 from genesis.utils.tools import FPSTracker
 from genesis.utils.misc import tensor_to_array, sanitize_index
-from genesis.vis import Visualizer
 from genesis.utils.warnings import warn_once
 
 if TYPE_CHECKING:
     from genesis.engine.entities.base_entity import Entity
     from genesis.recorders import Recorder
+
+
+class _NullLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+class _DummyContext:
+    def draw_debug_line(self, *args, **kwargs):
+        return None
+
+    def draw_debug_arrow(self, *args, **kwargs):
+        return None
+
+    def draw_debug_frame(self, *args, **kwargs):
+        return None
+
+    def draw_debug_frames(self, *args, **kwargs):
+        return None
+
+    def draw_debug_mesh(self, *args, **kwargs):
+        return None
+
+    def draw_debug_sphere(self, *args, **kwargs):
+        return None
+
+    def draw_debug_spheres(self, *args, **kwargs):
+        return None
+
+    def draw_debug_box(self, *args, **kwargs):
+        return None
+
+    def draw_debug_points(self, *args, **kwargs):
+        return None
+
+    def clear_debug_object(self, *args, **kwargs):
+        return None
+
+    def clear_debug_objects(self, *args, **kwargs):
+        return None
+
+
+class _DummyVisualizer:
+    def __init__(self, *args, **kwargs):
+        self._is_built = False
+        self.viewer_lock = _NullLock()
+        self.context = _DummyContext()
+        self.viewer = None
+        self.rasterizer = None
+        self.raytracer = None
+        self.batch_renderer = None
+        self.segmentation_idx_dict = {}
+
+    @property
+    def is_built(self):
+        return self._is_built
+
+    def build(self):
+        self._is_built = True
+
+    def destroy(self):
+        self._is_built = False
+
+    def reset(self):
+        return None
+
+    def update(self, force=True, auto=None):
+        return None
+
+    def update_visual_states(self, force_render=False):
+        return None
+
+    def add_camera(self, *args, **kwargs):
+        gs.raise_exception("Rendering is disabled (GS_DISABLE_RENDERING=1).")
+
+    def add_mesh_light(self, *args, **kwargs):
+        gs.raise_exception("Rendering is disabled (GS_DISABLE_RENDERING=1).")
+
+    def add_light(self, *args, **kwargs):
+        gs.raise_exception("Rendering is disabled (GS_DISABLE_RENDERING=1).")
 
 
 @gs.assert_initialized
@@ -189,14 +271,19 @@ class Scene(RBC):
             pbd_options=self.pbd_options,
         )
 
-        # visualizer
-        self._visualizer = Visualizer(
-            scene=self,
-            show_viewer=show_viewer,
-            vis_options=vis_options,
-            viewer_options=viewer_options,
-            renderer_options=renderer,
-        )
+        # visualizer (can be disabled for headless server runs)
+        if os.environ.get("GS_DISABLE_RENDERING") == "1":
+            self._visualizer = _DummyVisualizer()
+        else:
+            from genesis.vis import Visualizer
+
+            self._visualizer = Visualizer(
+                scene=self,
+                show_viewer=show_viewer,
+                vis_options=vis_options,
+                viewer_options=viewer_options,
+                renderer_options=renderer,
+            )
 
         # recorders
         self._recorder_manager = RecorderManager(self._sim.dt)

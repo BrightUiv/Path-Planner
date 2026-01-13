@@ -110,17 +110,17 @@ def get_cfgs():
 """
 def get_mappo_cfg():
     return {
-        "lr_actor": 5e-4,       # Actor学习率（大batch可用更高lr）
-        "lr_critic": 1e-3,      # Critic学习率（通常比Actor高）
-        "gamma": 0.99,          # 折扣因子（长期奖励权重）
-        "lam": 0.95,            # GAE lambda（优势估计平滑系数）
-        "clip_param": 0.2,      # PPO裁剪参数（限制策略更新幅度）
-        "entropy_coef": 0.01,   # 熵系数（鼓励探索）
+        "lr_actor": 3e-4,       # Actor学习率（适中，避免不稳定）
+        "lr_critic": 5e-4,      # Critic学习率
+        "gamma": 0.99,          # 折扣因子
+        "lam": 0.95,            # GAE lambda
+        "clip_param": 0.2,      # PPO裁剪参数
+        "entropy_coef": 0.005,  # 降低熵系数，减少随机性
         "value_loss_coef": 0.5, # 价值损失系数
-        "max_grad_norm": 1.0,   # 梯度裁剪阈值
-        "num_epochs": 4,        # 每次更新的epoch数（大batch不需要太多）
-        "batch_size": 2048,     # 批量大小
-        "share_actor": False,   # 独立Actor：每架无人机学习自己的策略
+        "max_grad_norm": 0.5,   # 更严格的梯度裁剪，防止崩溃
+        "num_epochs": 5,        # 增加epoch数，充分利用数据
+        "batch_size": 4096,     # 4090显存大，用更大batch
+        "share_actor": False,   # 独立Actor
     }
 
 
@@ -355,14 +355,14 @@ def main():
                         help="实验名称（用于日志目录）")
     parser.add_argument("-v", "--vis", action="store_true", default=False,
                         help="启用可视化窗口")
-    parser.add_argument("-B", "--num_envs", type=int, default=4096,
-                        help="并行环境数量")
+    parser.add_argument("-B", "--num_envs", type=int, default=8192,
+                        help="并行环境数量（4090推荐8192）")
     parser.add_argument("--max_iterations", type=int, default=800,
                         help="最大训练迭代次数")
     parser.add_argument("--save_interval", type=int, default=100,
                         help="模型保存间隔")
-    parser.add_argument("--num_steps", type=int, default=100,
-                        help="每次迭代每个环境的步数")
+    parser.add_argument("--num_steps", type=int, default=64,
+                        help="每次迭代每个环境的步数（更短更频繁更新）")
     args = parser.parse_args()
 
     # ==================== 初始化Genesis仿真引擎 ====================
