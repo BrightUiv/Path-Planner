@@ -23,17 +23,21 @@ PPO是一种高效稳定的策略梯度算法，通过限制策略更新的幅�
 - PyTorch: 深度学习框架
 
 使用方法：
-# 无可视化（快速训练）
-python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 4096 --max_iterations 1000
+# 无可视化（快速训练，使用GPU 0）
+python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 4096 --max_iterations 1000 --gpu 0
 
 # 带可视化（调试用）
-python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 64 --max_iterations 1000 -v
+python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 64 --max_iterations 1000 -v --gpu 0
+
+# 4090显卡推荐配置（24GB显存，可运行更多环境）
+python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 8192 --max_iterations 1500 --gpu 0
 """
 import argparse
 import os
 import pickle
 import shutil
 from importlib import metadata
+import torch
 
 # ==================== 版本检查 ====================
 # 确保安装了正确版本的rsl-rl库
@@ -87,8 +91,8 @@ def get_train_cfg(exp_name, max_iterations):
             "desired_kl": 0.01,  # 目标KL散度，用于自适应学习率调整
                                  # 如果KL散度超过这个值，降低学习率
 
-            "entropy_coef": 0.01,  # 熵正则化系数，鼓励探索
-                                   # 值越大，策略越倾向于随机
+            "entropy_coef": 0.005,  # 熵正则化系数（略微降低，减少随机性）
+                                    # 值越大，策略越倾向于随机
 
             "gamma": 0.99,  # 折扣因子γ，决定未来奖励的重要性
                            # 0.99表示长期奖励很重要
@@ -96,15 +100,15 @@ def get_train_cfg(exp_name, max_iterations):
             "lam": 0.95,  # GAE(广义优势估计)的λ参数
                           # 用于平衡偏差和方差的权衡
 
-            "learning_rate": 0.0003,  # 初始学习率
-                                       # 使用自适应调整
+            "learning_rate": 0.001,  # 初始学习率（增大，加快学习）
+                                     # 使用自适应调整
 
-            "max_grad_norm": 1.0,  # 梯度裁剪阈值，防止梯度爆炸
+            "max_grad_norm": 0.5,  # 梯度裁剪阈值（减小，更稳定）
 
-            "num_learning_epochs": 5,  # 每批数据的训练轮数
+            "num_learning_epochs": 8,  # 每批数据的训练轮数（增加）
                                        # PPO可以在同一批数据上多次更新
 
-            "num_mini_batches": 4,  # 每批数据分成的小批次数
+            "num_mini_batches": 8,  # 每批数据分成的小批次数（增加，减少显存）
                                     # 用于mini-batch SGD
 
             "schedule": "adaptive",  # 学习率调整策略
@@ -263,25 +267,28 @@ def get_cfgs():
     }
 
     '''
-        奖励函数的设计：
+        奖励函数的设计（优化版）：
+        - 增强存活奖励，鼓励无人机保持飞行
+        - 增大坠毁惩罚，强烈阻止坠毁行为
+        - 增强障碍物惩罚，提前学会避障
     '''
     # 奖励函数 = Σ (reward_scale * reward_function)
     # 正值表示奖励，负值表示惩罚
     reward_cfg = {
         "reward_scales": {
             # 目标接近奖励（主要奖励）
-            "target": 50.0,  # 接近目标的奖励权重
+            "target": 80.0,  # 接近目标的奖励权重（增大）
 
             # 进度奖励（辅助奖励）
-            "progress": 30.0,  # Y方向前进、高度保持、姿态稳定
+            "progress": 50.0,  # Y方向前进、高度保持、姿态稳定（增大）
 
-            # 存活奖励
-            "alive": 5.0,  # 每步存活的基础奖励
+            # 存活奖励（大幅增加，鼓励存活）
+            "alive": 20.0,  # 每步存活的基础奖励
 
             # 惩罚项（负权重）
-            "smooth": -1e-6,  # 动作平滑性惩罚（很小的值，主要用于打破平局）
-            "crash": -5.0,  # 坠毁惩罚
-            "obstacle": -1.0,  # 接近障碍物的惩罚
+            "smooth": -0.01,  # 动作平滑性惩罚（略微增大）
+            "crash": -200.0,  # 坠毁惩罚（大幅增加！）
+            "obstacle": -50.0,  # 接近障碍物的惩罚（大幅增加）
         },
     }
 
@@ -314,7 +321,29 @@ def main():
                         help="并行环境数量（越多越快，但需要更多GPU内存）")
     parser.add_argument("--max_iterations", type=int, default=1000,
                         help="最大训练迭代次数")
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="指定使用的GPU编号（默认0）")
     args = parser.parse_args()
+
+    # ==================== GPU检查与设置 ====================
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA不可用！请检查GPU驱动和CUDA安装。")
+
+    # 设置使用的GPU设备
+    torch.cuda.set_device(args.gpu)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
+
+    # 打印GPU信息
+    gpu_name = torch.cuda.get_device_name(args.gpu)
+    gpu_memory = torch.cuda.get_device_properties(args.gpu).total_memory / 1024**3
+    print(f"\n{'='*60}")
+    print(f"GPU Information")
+    print(f"{'='*60}")
+    print(f"Device: GPU {args.gpu} - {gpu_name}")
+    print(f"Total Memory: {gpu_memory:.1f} GB")
+    print(f"CUDA Version: {torch.version.cuda}")
+    print(f"PyTorch Version: {torch.__version__}")
+    print(f"{'='*60}\n")
 
     # ==================== 初始化Genesis ====================
     # backend=gs.gpu: 使用GPU加速
@@ -395,6 +424,15 @@ def main():
     # 这是使用自定义网络的关键步骤
     runner.alg.actor_critic = actor_critic
     print(f"Replaced default ActorCritic with CNNMLPActorCritic\n")
+
+    # ==================== GPU使用验证 ====================
+    # 验证模型和数据都在GPU上
+    print(f"Model device: {next(actor_critic.parameters()).device}")
+    print(f"Obs buffer device: {env.obs_buf.device}")
+    if torch.cuda.is_available():
+        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated() / 1024**2:.1f} MB")
+        print(f"GPU Memory Cached: {torch.cuda.memory_reserved() / 1024**2:.1f} MB")
+    print()
 
     # ==================== 开始训练 ====================
     # learn()方法执行完整的PPO训练循环：

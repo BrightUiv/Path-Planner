@@ -206,6 +206,15 @@ class SingleDronePPOEnv:
         # d_max 是策略开始提前反应的距离，通常取2-4m
         self.perception_d_max = env_cfg.get("perception_d_max", 3.0)  # 感知最大距离(米)
 
+        # 预计算障碍物张量（用于向量化计算，避免每步重复创建）
+        if len(self.obstacles) > 0:
+            self.obs_positions = torch.stack([obs["pos"] for obs in self.obstacles])  # (num_obs, 3)
+            self.obs_radii = torch.tensor([obs["radius"] for obs in self.obstacles],
+                                          device=gs.device, dtype=gs.tc_float)  # (num_obs,)
+        else:
+            self.obs_positions = None
+            self.obs_radii = None
+
         # ==================== 添加单架无人机 ====================
         # 无人机起点和终点位置
         self.drone_init_position = env_cfg.get("drone_init_position", [0.0, -2.5, 0.8])
@@ -295,78 +304,69 @@ class SingleDronePPOEnv:
 
     def _compute_obstacle_grid(self):
         """
-        计算7x7x3障碍物感知网格（线性衰减方案）
+        计算7x7x3障碍物感知网格（线性衰减方案）- 完全向量化版本
 
         该函数实现了一个局部感知系统，采用线性衰减表示障碍物距离：
-        - 以无人机为中心，构建一个7x7x3的网格（水平方向更宽，垂直方向较窄）
-        - 每个网格单元的值表示该方位障碍物的"危险程度"
+        - 以无人机为中心，构建一个7x7x3的网格
         - 使用线性衰减公式：v = max(0, 1 - d / d_max)
 
-        线性衰减方案的含义：
-        - d = 0（接触障碍物）时：v = 1（最大危险）
-        - d = d_max（达到感知最远距离）时：v = 0
-        - 0 < d < d_max 时：v 在 (0, 1) 区间内线性变化
-        - d > d_max 时：v = 0（不感知）
-
-        网格坐标系（7x7x3）：
-        - X轴：左(-3) -> 中(0) -> 右(+3)，共7格
-        - Y轴：后(-3) -> 中(0) -> 前(+3)，共7格
-        - Z轴：下(-1) -> 中(0) -> 上(+1)，共3格
+        性能优化：完全使用PyTorch向量化操作，无Python循环，充分利用GPU并行
 
         Returns:
             torch.Tensor: 形状为 (num_envs, grid_size_x, grid_size_y, grid_size_z) 的网格张量
-                         值范围 [0, 1]，越接近1表示障碍物越近/越危险
         """
-        # 初始化全零网格：(num_envs, 7, 7, 3)
-        grid = torch.zeros((self.num_envs, self.grid_size_x, self.grid_size_y, self.grid_size_z),
-                          device=gs.device, dtype=gs.tc_float)
-
         # 如果没有障碍物，直接返回空网格
         if len(self.obstacles) == 0:
-            return grid
+            return torch.zeros((self.num_envs, self.grid_size_x, self.grid_size_y, self.grid_size_z),
+                              device=self.device, dtype=gs.tc_float)
 
-        # 网格中心偏移量（各轴独立计算）
-        half_size_x = self.grid_size_x // 2  # 3
-        half_size_y = self.grid_size_y // 2  # 3
-        half_size_z = self.grid_size_z // 2  # 1
-        d_max = self.perception_d_max  # 感知最大距离
+        # 网格参数
+        half_x, half_y, half_z = self.grid_size_x // 2, self.grid_size_y // 2, self.grid_size_z // 2
+        d_max = self.perception_d_max
 
-        # 遍历所有环境和障碍物
-        for env_idx in range(self.num_envs):
-            drone_pos = self.base_pos[env_idx]  # 当前环境中无人机的位置
+        # ==================== 完全向量化计算 ====================
+        # 计算相对位置: (num_envs, num_obs, 3)
+        rel_pos = self.obs_positions.unsqueeze(0) - self.base_pos.unsqueeze(1)
 
-            for obs in self.obstacles:
-                obs_pos = obs["pos"]  # 障碍物位置
-                obs_radius = obs["radius"]  # 障碍物半径
+        # 计算网格坐标: (num_envs, num_obs, 3)
+        grid_x = (rel_pos[:, :, 0] / self.grid_resolution + half_x).long()
+        grid_y = (rel_pos[:, :, 1] / self.grid_resolution + half_y).long()
+        grid_z = (rel_pos[:, :, 2] / self.grid_resolution + half_z).long()
 
-                # 计算障碍物相对于无人机的位置
-                rel_pos = obs_pos - drone_pos
+        # 有效性掩码: (num_envs, num_obs)
+        valid = ((grid_x >= 0) & (grid_x < self.grid_size_x) &
+                 (grid_y >= 0) & (grid_y < self.grid_size_y) &
+                 (grid_z >= 0) & (grid_z < self.grid_size_z))
 
-                # 将相对位置转换为网格坐标（各轴独立）
-                # grid_resolution 决定每个网格单元的物理大小
-                grid_x = int((rel_pos[0] / self.grid_resolution) + half_size_x)
-                grid_y = int((rel_pos[1] / self.grid_resolution) + half_size_y)
-                grid_z = int((rel_pos[2] / self.grid_resolution) + half_size_z)
+        # 裁剪坐标到有效范围（避免索引越界）
+        grid_x = grid_x.clamp(0, self.grid_size_x - 1)
+        grid_y = grid_y.clamp(0, self.grid_size_y - 1)
+        grid_z = grid_z.clamp(0, self.grid_size_z - 1)
 
-                # 检查是否在网格范围内（各轴独立判断）
-                if (0 <= grid_x < self.grid_size_x and
-                    0 <= grid_y < self.grid_size_y and
-                    0 <= grid_z < self.grid_size_z):
+        # 计算感知值: (num_envs, num_obs)
+        dist = torch.norm(rel_pos, dim=2) - self.obs_radii.unsqueeze(0)
+        perception = torch.clamp(1.0 - torch.clamp(dist, min=0.0) / d_max, min=0.0)
+        perception = perception * valid.float()  # 无效位置置零
 
-                    # 计算到障碍物表面的距离（减去半径）
-                    dist_to_surface = torch.norm(rel_pos) - obs_radius
-                    dist_to_surface = max(0.0, dist_to_surface.item())  # 确保非负
+        # 将3D坐标转换为1D索引，用于scatter_reduce
+        # flat_idx = env_idx * (X*Y*Z) + x * (Y*Z) + y * Z + z
+        grid_total = self.grid_size_x * self.grid_size_y * self.grid_size_z
+        env_idx = torch.arange(self.num_envs, device=self.device).unsqueeze(1)  # (num_envs, 1)
+        flat_idx = (env_idx * grid_total +
+                    grid_x * (self.grid_size_y * self.grid_size_z) +
+                    grid_y * self.grid_size_z +
+                    grid_z)  # (num_envs, num_obs)
 
-                    # 线性衰减公式：v = max(0, 1 - d / d_max)
-                    # 距离越近，v越大（最大为1）
-                    # 距离超过d_max时，v为0
-                    perception_value = max(0.0, 1.0 - dist_to_surface / d_max)
+        # 展平所有数据
+        flat_idx = flat_idx.reshape(-1)  # (num_envs * num_obs,)
+        perception_flat = perception.reshape(-1)  # (num_envs * num_obs,)
 
-                    # 取最大值（如果多个障碍物影响同一网格）
-                    grid[env_idx, grid_x, grid_y, grid_z] = max(
-                        grid[env_idx, grid_x, grid_y, grid_z].item(),
-                        perception_value
-                    )
+        # 使用scatter_reduce进行最大值聚合
+        grid_flat = torch.zeros(self.num_envs * grid_total, device=self.device, dtype=gs.tc_float)
+        grid_flat.scatter_reduce_(0, flat_idx, perception_flat, reduce='amax', include_self=True)
+
+        # 重塑为网格形状
+        grid = grid_flat.reshape(self.num_envs, self.grid_size_x, self.grid_size_y, self.grid_size_z)
 
         return grid
 
@@ -533,30 +533,28 @@ class SingleDronePPOEnv:
 
     def _get_min_obstacle_distance(self):
         """
-        计算每个环境中无人机与最近障碍物的距离
+        计算每个环境中无人机与最近障碍物的距离 - 向量化版本
 
         只考虑XY平面的距离（因为障碍物是垂直的圆柱体）。
         距离计算为无人机到圆柱体表面的距离（减去圆柱体半径）。
 
         Returns:
             torch.Tensor: 形状为 (num_envs,) 的距离张量
-                         如果没有障碍物，返回100.0（足够大的值）
         """
-        # 初始化为一个很大的值
-        min_dist = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float) * 100.0
-
         if len(self.obstacles) == 0:
-            return min_dist
+            return torch.ones((self.num_envs,), device=self.device, dtype=gs.tc_float) * 100.0
 
-        # 获取无人机的XY坐标
-        drone_pos_xy = self.base_pos[:, :2]
+        # 向量化计算：所有环境到所有障碍物的距离
+        # drone_pos_xy: (num_envs, 2) -> (num_envs, 1, 2)
+        # obs_positions_xy: (num_obs, 2) -> (1, num_obs, 2)
+        drone_pos_xy = self.base_pos[:, :2].unsqueeze(1)  # (num_envs, 1, 2)
+        obs_pos_xy = self.obs_positions[:, :2].unsqueeze(0)  # (1, num_obs, 2)
 
-        # 遍历所有障碍物，找最近的
-        for obs in self.obstacles:
-            obs_pos_xy = obs["pos"][:2].unsqueeze(0)  # 障碍物中心的XY坐标
-            # 计算到圆柱体表面的距离
-            dist = torch.norm(drone_pos_xy - obs_pos_xy, dim=1) - obs["radius"]
-            min_dist = torch.minimum(min_dist, dist)
+        # 计算到所有障碍物表面的距离: (num_envs, num_obs)
+        dist_to_surface = torch.norm(drone_pos_xy - obs_pos_xy, dim=2) - self.obs_radii.unsqueeze(0)
+
+        # 取每个环境的最小距离: (num_envs,)
+        min_dist = dist_to_surface.min(dim=1)[0]
 
         return min_dist
 

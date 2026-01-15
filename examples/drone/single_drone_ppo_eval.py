@@ -117,10 +117,13 @@ def main():
     policy_cfg = train_cfg["policy"]
     cnn_mlp_cfg = train_cfg["cnn_mlp_policy"]
 
+    # 兼容新旧配置格式：grid_shape (新) 或 grid_size (旧)
+    grid_size = obs_cfg.get("grid_shape", obs_cfg.get("grid_size", (7, 7, 3)))
+
     actor_critic = CNNMLPActorCritic(
         num_state_obs=env.num_state_obs,  # 自身状态维度: 19
         num_actions=env.num_actions,  # 动作维度: 4
-        grid_size=obs_cfg["grid_size"],  # 网格大小: 3
+        grid_size=grid_size,  # 网格形状: (7, 7, 3) 或 3
         cnn_channels=cnn_mlp_cfg["cnn_channels"],  # CNN通道
         mlp_hidden_dims=cnn_mlp_cfg["mlp_hidden_dims"],  # MLP隐藏层
         actor_hidden_dims=policy_cfg["actor_hidden_dims"],  # Actor隐藏层
