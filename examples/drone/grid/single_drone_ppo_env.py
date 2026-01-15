@@ -167,7 +167,7 @@ class SingleDronePPOEnv:
         self.obstacles = []  # 存储障碍物信息的列表
         obstacle_positions = env_cfg.get("obstacle_positions", [])  # 障碍物位置列表
         obstacle_radius = env_cfg.get("obstacle_radius", 0.12)  # 障碍物半径
-        obstacle_height = env_cfg.get("obstacle_height", 2.5)  # 障碍物高度
+        obstacle_height = env_cfg.get("obstacle_height", 1.5)  # 障碍物高度
 
         # 遍历所有障碍物位置，创建圆柱形障碍物
         for pos in obstacle_positions:
@@ -215,10 +215,10 @@ class SingleDronePPOEnv:
             self.obs_positions = None
             self.obs_radii = None
 
-        # ==================== 添加单架无人机 ====================
+       
         # 无人机起点和终点位置
-        self.drone_init_position = env_cfg.get("drone_init_position", [0.0, -2.5, 0.8])
-        self.drone_goal_position = env_cfg.get("drone_goal_position", [0.0, 2.5, 0.8])
+        self.drone_init_position = env_cfg.get("drone_init_position", [0.0, -2.5, 0.6])
+        self.drone_goal_position = env_cfg.get("drone_goal_position", [0.0, 2.5, 0.6])
 
         # 初始姿态四元数（单位四元数，表示无旋转）
         # 四元数格式：[w, x, y, z]
