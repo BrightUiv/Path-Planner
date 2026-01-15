@@ -431,8 +431,8 @@ class SingleDronePPOEnv:
 
         # 设置无人机电机转速
         # 基础转速 14468.429... RPM 是悬停所需的转速
-        # actions * 0.8 表示在基础转速上下浮动 ±80%
-        self.drone.set_propellels_rpm((1 + self.actions * 0.8) * 14468.429183500699)
+        # actions * 0.4 表示在基础转速上下浮动 ±40%（降低！使控制更稳定）
+        self.drone.set_propellels_rpm((1 + self.actions * 0.4) * 14468.429183500699)
 
         # 推进物理仿真一个时间步
         self.scene.step()
@@ -776,6 +776,49 @@ class SingleDronePPOEnv:
         Returns:
             torch.Tensor: 存活环境返回1.0，坠毁环境返回0.0
         """
-        alive_rew = torch.ones((self.num_envs,), device=gs.device, dtype=gs.tc_float)
+        alive_rew = torch.ones((self.num_envs,), device=self.device, dtype=gs.tc_float)
         alive_rew[self.crash_condition] = 0  # 坠毁的环境没有存活奖励
         return alive_rew
+
+    def _reward_stability(self):
+        """
+        姿态稳定性奖励
+
+        奖励无人机保持稳定的姿态和低角速度。
+        这是学习飞行的基础，必须先学会稳定悬停。
+
+        奖励组成：
+        1. 角速度惩罚：旋转越快惩罚越大
+        2. 姿态奖励：roll/pitch越小奖励越大
+        3. 水平速度惩罚：防止失控漂移
+
+        Returns:
+            torch.Tensor: 稳定性奖励值
+        """
+        stability_rew = torch.zeros((self.num_envs,), device=self.device, dtype=gs.tc_float)
+
+        # 1. 角速度惩罚（核心！防止旋转失控）
+        ang_vel_norm = torch.norm(self.base_ang_vel, dim=1)
+        stability_rew -= ang_vel_norm * 0.5  # 角速度越大，惩罚越大
+
+        # 2. 姿态奖励：roll和pitch越接近0越好
+        roll = torch.abs(self.base_euler[:, 0])  # 度
+        pitch = torch.abs(self.base_euler[:, 1])  # 度
+
+        # 姿态良好（roll和pitch都小于15度）给予奖励
+        attitude_good = (roll < 15) & (pitch < 15)
+        stability_rew += torch.where(attitude_good,
+                                     torch.ones_like(roll) * 2.0,   # 姿态好：奖励
+                                     torch.zeros_like(roll))
+
+        # 姿态一般（15-30度）给予小奖励
+        attitude_ok = (roll < 30) & (pitch < 30) & ~attitude_good
+        stability_rew += torch.where(attitude_ok,
+                                     torch.ones_like(roll) * 0.5,
+                                     torch.zeros_like(roll))
+
+        # 3. 水平速度适度惩罚（防止失控漂移）
+        horizontal_vel = torch.norm(self.base_lin_vel[:, :2], dim=1)
+        stability_rew -= torch.clamp(horizontal_vel - 1.0, min=0.0) * 0.2  # 超过1m/s才惩罚
+
+        return stability_rew
