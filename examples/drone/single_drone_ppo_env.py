@@ -570,6 +570,7 @@ class SingleDronePPOEnv:
         self.extras["observations"]["critic"] = self.obs_buf
         return self.obs_buf, self.extras
 
+    # 特权观测
     def get_privileged_observations(self):
         """
         获取特权观测（用于教师-学生训练范式）
@@ -580,7 +581,8 @@ class SingleDronePPOEnv:
             None
         """
         return None
-
+    
+    # 重置指定的环境到初始状态
     def reset_idx(self, envs_idx):
         """
         重置指定的环境到初始状态
@@ -731,9 +733,10 @@ class SingleDronePPOEnv:
 
         return obstacle_rew
 
+    # 进度方向的奖励
     def _reward_progress(self):
         """
-        进度奖励
+ 
 
         综合奖励，包含多个方面：
         1. Y方向前进（主要移动方向）
@@ -765,7 +768,8 @@ class SingleDronePPOEnv:
                                     -torch.ones_like(roll) * 1.0)  # 姿态不稳：惩罚
 
         return progress_rew
-
+    
+    # 存活奖励
     def _reward_alive(self):
         """
         存活奖励
@@ -780,10 +784,9 @@ class SingleDronePPOEnv:
         alive_rew[self.crash_condition] = 0  # 坠毁的环境没有存活奖励
         return alive_rew
 
+    # 姿态稳定性的奖励
     def _reward_stability(self):
         """
-        姿态稳定性奖励
-
         奖励无人机保持稳定的姿态和低角速度。
         这是学习飞行的基础，必须先学会稳定悬停。
 
