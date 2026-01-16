@@ -17,8 +17,8 @@ except ImportError:
     print("Error: Could not import 'mappo_algorithm.py'.")
     exit()
 
+# 生成圆形障碍物阵列
 def generate_circular_obstacles(max_radius=3, obstacle_radius=0.12, spacing=1):
-    """生成圆形障碍物阵列"""
     obstacles = []
     start_radius = 0.8 
     current_radius = start_radius
@@ -33,6 +33,7 @@ def generate_circular_obstacles(max_radius=3, obstacle_radius=0.12, spacing=1):
         current_radius += spacing * 0.9 
     return obstacles
 
+# 设置训练的配置参数
 def get_train_cfg(exp_name, max_iterations):
     train_cfg_dict = {
         "algorithm": {
@@ -69,12 +70,14 @@ def get_train_cfg(exp_name, max_iterations):
     }
     return train_cfg_dict
 
+# 提供参数配置
 def get_cfgs():
     num_drones = 3
     
     # 生成圆形障碍物分布
     obstacles = generate_circular_obstacles(max_radius=3, obstacle_radius=0.1, spacing=1.0)
     
+    # 环境参数
     env_cfg = {
         "num_drones": num_drones,
         "num_actions": 4,
@@ -117,6 +120,7 @@ def get_cfgs():
     # 全局观测 (Critic): 拼接所有 Agent 的局部观测
     global_obs_dim = local_obs_dim * num_drones
     
+    # 观测参数
     obs_cfg = {
         "num_obs": local_obs_dim, 
         "num_privileged_obs": global_obs_dim,
@@ -129,6 +133,7 @@ def get_cfgs():
         },
     }
     
+    # 奖励参数
     reward_cfg = {
         "yaw_lambda": -10.0,
         "reward_scales": {
@@ -146,6 +151,7 @@ def get_cfgs():
     }
     
     command_cfg = {"num_commands": 3}
+
     return env_cfg, obs_cfg, reward_cfg, command_cfg
 
 def main():

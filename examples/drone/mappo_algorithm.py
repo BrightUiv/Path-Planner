@@ -9,6 +9,9 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 import gc
 
+'''
+    搭建神经网络的构架
+'''
 class ActorCritic(nn.Module):
     def __init__(self, num_actor_obs, num_critic_obs, num_actions, 
                  actor_hidden_dims=[256, 128, 64], 
@@ -33,7 +36,7 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(last_layer.weight, 0.01)
         nn.init.constant_(last_layer.bias, 0.0)
         
-        self.log_std = nn.Parameter(np.log(init_noise_std) * torch.ones(num_actions))
+        self.log_std = nn.Parameter(np.log(init_noise_std) * torch.ones(num_actions)) # 将噪声纳入到调参范围之中
 
         # Critic 网络
         critic_layers = []
@@ -47,11 +50,13 @@ class ActorCritic(nn.Module):
 
         self.apply(self._init_weights)
 
+    # 权重初始化
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.orthogonal_(m.weight, np.sqrt(2))
             nn.init.constant_(m.bias, 0.0)
 
+    # 输出actor动作
     def act(self, obs):
         return self.actor(obs)
     
@@ -62,60 +67,66 @@ class ActorCritic(nn.Module):
         mean = self.actor(actor_obs)
         # Std Clamping: 防止方差过小导致数值不稳定
         std = self.log_std.exp().expand_as(mean)
-        std = torch.clamp(std, min=0.05) 
+        std = torch.clamp(std, min=0.05)  # 防止除以0
         
-        dist = Normal(mean, std)
+        dist = Normal(mean, std) # 正态分布
         
         if action is None:
             action = dist.sample()
         
-        log_prob = dist.log_prob(action).sum(dim=-1)
-        entropy = dist.entropy().sum(dim=-1)
-        value = self.critic(critic_obs)
+        log_prob = dist.log_prob(action).sum(dim=-1) # 计算概率
+        entropy = dist.entropy().sum(dim=-1) # 计算熵
+        value = self.critic(critic_obs) # 计算评价值
 
         return action, log_prob, entropy, value
 
 class MAPPO:
+    # 进行初始化
     def __init__(self, actor_critic, cfg):
+
         self.ac = actor_critic
         self.cfg = cfg
         
         self.learning_rate = cfg["learning_rate"]
         self.optimizer = optim.Adam(self.ac.parameters(), lr=self.learning_rate)
         
-    def update(self, storage):
+    def update(self, storage): # storage经验缓冲区
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy_loss = 0
         
         # 展平缓冲区数据
-        b_obs = storage["obs"].reshape((-1, storage["obs"].shape[-1]))
-        b_priv_obs = storage["priv_obs"].reshape((-1, storage["priv_obs"].shape[-1]))
-        b_actions = storage["actions"].reshape((-1, storage["actions"].shape[-1]))
-        b_logprobs = storage["logprobs"].reshape(-1)
-        b_advantages = storage["advantages"].reshape(-1)
-        b_returns = storage["returns"].reshape(-1)
-        b_values = storage["values"].reshape(-1)
+        b_obs = storage["obs"].reshape((-1, storage["obs"].shape[-1])) # Actor观测：每个agent的局部观测（31维)
+        b_priv_obs = storage["priv_obs"].reshape((-1, storage["priv_obs"].shape[-1])) # Critic观测：全局状态信息（93维 = 31×3）
+        b_actions = storage["actions"].reshape((-1, storage["actions"].shape[-1])) # 执行的动作（4个电机的控制量)
+        b_logprobs = storage["logprobs"].reshape(-1) # 动作的对数概率（用于PPO更新）
+        b_advantages = storage["advantages"].reshape(-1) # 优势函数 A = Q - V（用于策略梯度）
+        b_returns = storage["returns"].reshape(-1) # 计算的回报值（奖励折扣和）
+        b_values = storage["values"].reshape(-1)  # Critic预测的状态价值 V(s) 
 
         # Advantage Normalization (Batch Level)
-        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8) # 归一化
 
-        batch_size = b_obs.shape[0]
-        minibatch_size = batch_size // self.cfg["num_mini_batches"]
+        batch_size = b_obs.shape[0] # 总的样本数
+        minibatch_size = batch_size // self.cfg["num_mini_batches"] # 划分为小的样本数
 
         accumulated_kl = 0.0
         num_updates = 0
 
         for _ in range(self.cfg["num_learning_epochs"]):
+            # 随机打乱数据
             indices = torch.randperm(batch_size, device=b_obs.device)
+            # 遍历mini-batch
             for start in range(0, batch_size, minibatch_size):
                 end = start + minibatch_size
                 mb_idx = indices[start:end]
 
+                # 计算新策略的 log_prob
                 _, new_logprob, entropy, new_value = self.ac.get_actions_log_prob_entropy_value(
                     b_obs[mb_idx], b_priv_obs[mb_idx], b_actions[mb_idx]
                 )
                 
+                # 计算KL散度
                 log_ratio = new_logprob - b_logprobs[mb_idx]
                 ratio = torch.exp(log_ratio)
                 
@@ -173,6 +184,7 @@ class MAPPO:
         }
 
 class MAPPORunner:
+    # 初始化与环境的交互
     def __init__(self, env, train_cfg, log_dir, device="cuda:0"):
         self.env = env
         self.cfg = train_cfg["algorithm"]
@@ -340,3 +352,4 @@ class MAPPORunner:
         self.start_iteration = checkpoint.get('iteration', 0)
         
         print(f"Loaded model from {path}, resuming from iter: {self.start_iteration}")
+  
