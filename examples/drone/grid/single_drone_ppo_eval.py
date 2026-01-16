@@ -33,8 +33,13 @@ import pickle
 import torch
 
 import genesis as gs
-from single_drone_ppo_env import SingleDronePPOEnv  # 自定义环境
-from cnn_mlp_actor_critic import CNNMLPActorCritic  # 自定义网络
+from single_drone_ppo_env import SingleDronePPOEnv  # 自定义环境（相对导入）
+from mlp_actor_critic import MLPActorCritic  # 纯MLP网络（相对导入）
+# 为了兼容旧模型，也导入CNN+MLP网络
+try:
+    from cnn_mlp_actor_critic import CNNMLPActorCritic
+except ImportError:
+    CNNMLPActorCritic = None
 
 # ==================== 版本检查 ====================
 # 确保安装了正确版本的rsl-rl库
@@ -114,23 +119,44 @@ def main():
 
     # ==================== 创建网络 ====================
     # 使用与训练时相同的网络架构
+    # 自动检测使用纯MLP还是CNN+MLP混合架构
     policy_cfg = train_cfg["policy"]
-    cnn_mlp_cfg = train_cfg["cnn_mlp_policy"]
 
-    # 兼容新旧配置格式：grid_shape (新) 或 grid_size (旧)
-    grid_size = obs_cfg.get("grid_shape", obs_cfg.get("grid_size", (7, 7, 3)))
+    # 检测网络类型：如果有mlp_policy配置，使用纯MLP；否则使用CNN+MLP
+    if "mlp_policy" in train_cfg:
+        # 纯MLP架构
+        print("Detected Pure MLP architecture")
+        mlp_cfg = train_cfg["mlp_policy"]
 
-    actor_critic = CNNMLPActorCritic(
-        num_state_obs=env.num_state_obs,  # 自身状态维度: 19
-        num_actions=env.num_actions,  # 动作维度: 4
-        grid_size=grid_size,  # 网格形状: (7, 7, 3) 或 3
-        cnn_channels=cnn_mlp_cfg["cnn_channels"],  # CNN通道
-        mlp_hidden_dims=cnn_mlp_cfg["mlp_hidden_dims"],  # MLP隐藏层
-        actor_hidden_dims=policy_cfg["actor_hidden_dims"],  # Actor隐藏层
-        critic_hidden_dims=policy_cfg["critic_hidden_dims"],  # Critic隐藏层
-        activation=policy_cfg["activation"],  # 激活函数
-        init_noise_std=policy_cfg["init_noise_std"],  # 初始噪声（评估时不使用）
-    ).to(gs.device)
+        actor_critic = MLPActorCritic(
+            num_obs=env.num_obs,  # 总观测维度
+            num_actions=env.num_actions,  # 动作维度: 4
+            backbone_hidden_dims=mlp_cfg["backbone_hidden_dims"],  # Backbone
+            actor_hidden_dims=policy_cfg["actor_hidden_dims"],  # Actor头
+            critic_hidden_dims=policy_cfg["critic_hidden_dims"],  # Critic头
+            activation=policy_cfg["activation"],  # 激活函数
+            init_noise_std=policy_cfg["init_noise_std"],  # 初始噪声
+        ).to(gs.device)
+    else:
+        # CNN+MLP混合架构（兼容旧模型）
+        print("Detected CNN+MLP hybrid architecture")
+        if CNNMLPActorCritic is None:
+            raise ImportError("CNN+MLP architecture not available. Please ensure cnn_mlp_actor_critic.py exists.")
+
+        cnn_mlp_cfg = train_cfg["cnn_mlp_policy"]
+        grid_size = obs_cfg.get("grid_shape", obs_cfg.get("grid_size", (7, 7, 3)))
+
+        actor_critic = CNNMLPActorCritic(
+            num_state_obs=env.num_state_obs,  # 自身状态维度: 19
+            num_actions=env.num_actions,  # 动作维度: 4
+            grid_size=grid_size,  # 网格形状
+            cnn_channels=cnn_mlp_cfg["cnn_channels"],  # CNN通道
+            mlp_hidden_dims=cnn_mlp_cfg["mlp_hidden_dims"],  # MLP隐藏层
+            actor_hidden_dims=policy_cfg["actor_hidden_dims"],  # Actor隐藏层
+            critic_hidden_dims=policy_cfg["critic_hidden_dims"],  # Critic隐藏层
+            activation=policy_cfg["activation"],  # 激活函数
+            init_noise_std=policy_cfg["init_noise_std"],  # 初始噪声
+        ).to(gs.device)
 
     # ==================== 确定模型路径 ====================
     if args.ckpt > 0:

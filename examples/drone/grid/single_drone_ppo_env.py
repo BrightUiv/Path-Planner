@@ -4,7 +4,7 @@
 该环境实现了一个单架无人机在有障碍物的3D空间中进行路径规划的强化学习任务。
 无人机需要从起点飞行到目标点，同时避开圆柱形障碍物。
 
-观测空间设计：
+观测空间设计（2D平面导航版本）：
 1. 自身状态（19维）：
    - 全局位置 (3维)
    - 线速度 (3维)
@@ -14,8 +14,8 @@
    - 角速度 (3维)
    - 上一步动作 (4维)
 
-2. 障碍物感知（27维）- 线性衰减方案：
-   - 3x3x3立方体网格，以无人机为中心
+2. 障碍物感知（49维）- 线性衰减方案：
+   - 7x7x1网格（水平7x7，垂直单层），以无人机为中心
    - 每个格子的值表示该方位障碍物的"危险程度"
    - 使用线性衰减公式：v = max(0, 1 - d / d_max)
    - d=0时v=1（接触），d>=d_max时v=0（无感知）
@@ -95,17 +95,17 @@ class SingleDronePPOEnv:
             command_cfg (dict): 命令配置（目标点相关）
             show_viewer (bool): 是否显示可视化窗口
         """
-        # ==================== 基础配置 ====================
+        
         self.num_envs = num_envs  # 并行环境数量
         self.rendered_env_num = min(5, self.num_envs)  # 可视化时渲染的环境数量（最多5个）
 
         # 观测空间配置
         self.num_state_obs = obs_cfg["num_state_obs"]  # 自身状态维度（19维）
-        # 障碍物网格形状：(X宽度, Y深度, Z高度) = (7, 7, 3)
-        # 水平方向感知范围更大，垂直方向较小（障碍物是圆柱体）
-        self.grid_shape = obs_cfg.get("grid_shape", (7, 7, 3))
+        # 障碍物网格形状：(X宽度, Y深度, Z高度) = (7, 7, 1)
+        # 2D平面导航，水平方向7x7，垂直方向单层
+        self.grid_shape = obs_cfg.get("grid_shape", (7, 7, 1))
         self.grid_size_x, self.grid_size_y, self.grid_size_z = self.grid_shape
-        self.grid_dim = self.grid_size_x * self.grid_size_y * self.grid_size_z  # 7*7*3=147
+        self.grid_dim = self.grid_size_x * self.grid_size_y * self.grid_size_z  # 7*7*1=49
         self.grid_resolution = env_cfg.get("grid_resolution", 1.0)  # 每个网格单元的大小(米)
 
         self.num_privileged_obs = None  # 特权观测（用于教师-学生训练，这里不使用）
@@ -268,7 +268,7 @@ class SingleDronePPOEnv:
             self.episode_sums[name] = torch.zeros((self.num_envs,), device=gs.device, dtype=gs.tc_float)
 
         # ==================== 初始化状态缓冲区 ====================
-        # 总观测维度：state(19) + flattened_grid(7*7*3=147) = 166
+        # 总观测维度：state(19) + flattened_grid(7*7*1=49) = 68
         self.num_obs = self.num_state_obs + self.grid_dim
 
         # 核心缓冲区（所有并行环境共享）
@@ -304,10 +304,10 @@ class SingleDronePPOEnv:
 
     def _compute_obstacle_grid(self):
         """
-        计算7x7x3障碍物感知网格（线性衰减方案）- 完全向量化版本
+        计算障碍物感知网格（线性衰减方案）- 完全向量化版本
 
         该函数实现了一个局部感知系统，采用线性衰减表示障碍物距离：
-        - 以无人机为中心，构建一个7x7x3的网格
+        - 以无人机为中心，构建一个可配置的3D网格（默认7x7x1用于2D平面导航）
         - 使用线性衰减公式：v = max(0, 1 - d / d_max)
 
         性能优化：完全使用PyTorch向量化操作，无Python循环，充分利用GPU并行
@@ -516,11 +516,11 @@ class SingleDronePPOEnv:
             self.last_actions,  # 上一步动作 (4维)
         ], dim=-1)  # 总共19维
 
-        # 障碍物网格观测：7x7x3 -> 展平为147维
+        # 障碍物网格观测：grid_shape -> 展平（默认7x7x1=49维）
         obstacle_grid = self._compute_obstacle_grid()
-        obstacle_grid_flat = obstacle_grid.reshape(self.num_envs, -1)  # (num_envs, 147)
+        obstacle_grid_flat = obstacle_grid.reshape(self.num_envs, -1)  # (num_envs, grid_dim)
 
-        # 拼接完整观测：19 + 147 = 166维
+        # 拼接完整观测：19 + grid_dim（默认19+49=68维）
         self.obs_buf = torch.cat([state_obs, obstacle_grid_flat], dim=-1)
 
         # 更新上一步动作
@@ -736,11 +736,11 @@ class SingleDronePPOEnv:
     # 进度方向的奖励
     def _reward_progress(self):
         """
- 
+        综合奖励（2D平面导航优化版）
 
         综合奖励，包含多个方面：
         1. Y方向前进（主要移动方向）
-        2. 高度保持在合适范围
+        2. 高度保持在0.5-0.7m之间（强化约束，保持在同一平面）
         3. 姿态稳定性
 
         Returns:
@@ -752,12 +752,19 @@ class SingleDronePPOEnv:
         y_progress = self.base_pos[:, 1] - self.last_base_pos[:, 1]
         progress_rew += y_progress * 20.0  # Y方向前进奖励
 
-        # 高度保持奖励：保持在0.4m到1.5m之间
+        # 高度保持奖励（2D平面导航关键）：强制保持在0.5-0.7m之间
         height = self.base_pos[:, 2]
-        height_good = (height > 0.4) & (height < 1.5)
+        # 理想高度范围：0.5-0.7m（中心0.6m）
+        height_good = (height > 0.5) & (height < 0.7)
         progress_rew += torch.where(height_good,
-                                    torch.ones_like(height) * 1.0,   # 高度正常：奖励
-                                    -torch.ones_like(height) * 0.5)  # 高度异常：惩罚
+                                    torch.ones_like(height) * 2.0,   # 高度理想：大奖励
+                                    -torch.ones_like(height) * 2.0)  # 高度偏离：大惩罚
+
+        # 额外惩罚：高度偏离过大（超出0.4-0.8m范围）
+        height_bad = (height < 0.4) | (height > 0.8)
+        progress_rew += torch.where(height_bad,
+                                    -torch.ones_like(height) * 3.0,  # 严重偏离：额外惩罚
+                                    torch.zeros_like(height))
 
         # 姿态稳定奖励：roll和pitch都在30度以内
         roll = torch.abs(self.base_euler[:, 0])

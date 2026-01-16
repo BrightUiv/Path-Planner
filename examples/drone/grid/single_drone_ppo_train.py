@@ -1,5 +1,5 @@
 """
-单无人机避障路径规划训练脚本 - PPO版本 + CNN-MLP混合架构
+单无人机避障路径规划训练脚本 - PPO版本 + 纯MLP架构
 
 该脚本使用Proximal Policy Optimization (PPO)算法训练无人机避障策略。
 PPO是一种高效稳定的策略梯度算法，通过限制策略更新的幅度来保证训练稳定性。
@@ -7,7 +7,7 @@ PPO是一种高效稳定的策略梯度算法，通过限制策略更新的幅�
 训练流程：
 1. 初始化Genesis物理引擎
 2. 创建并行环境（数千个环境同时运行）
-3. 创建CNN-MLP混合网络
+3. 创建纯MLP网络（障碍物信息已编码为距离衰减值，直接用MLP处理）
 4. 使用rsl_rl的OnPolicyRunner进行训练
 5. 定期保存模型检查点
 
@@ -24,13 +24,13 @@ PPO是一种高效稳定的策略梯度算法，通过限制策略更新的幅�
 
 使用方法：
 # 无可视化（快速训练，使用GPU 0）
-python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 4096 --max_iterations 1000 --gpu 0
+python single_drone_ppo_train.py -e single-drone-mlp-ppo -B 4096 --max_iterations 1000 --gpu 0
 
 # 带可视化（调试用）
-python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 64 --max_iterations 1000 -v --gpu 0
+python single_drone_ppo_train.py -e single-drone-mlp-ppo -B 64 --max_iterations 1000 -v --gpu 0
 
 # 4090显卡推荐配置（24GB显存，可运行更多环境）
-python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 8192 --max_iterations 1500 --gpu 0
+python single_drone_ppo_train.py -e single-drone-mlp-ppo -B 8192 --max_iterations 1500 --gpu 0
 """
 import argparse
 import os
@@ -57,8 +57,8 @@ except (metadata.PackageNotFoundError, ImportError) as e:
 # 导入训练相关模块
 from rsl_rl.runners import OnPolicyRunner  # PPO训练器
 import genesis as gs
-from single_drone_ppo_env import SingleDronePPOEnv  # 自定义环境
-from cnn_mlp_actor_critic import CNNMLPActorCritic  # 自定义网络
+from single_drone_ppo_env import SingleDronePPOEnv  # 自定义环境（相对导入）
+from mlp_actor_critic import MLPActorCritic  # 纯MLP网络（相对导入）
 
 
 def get_train_cfg(exp_name, max_iterations):
@@ -125,25 +125,23 @@ def get_train_cfg(exp_name, max_iterations):
         # ==================== 策略网络配置 ====================
         "policy": {
             "class_name": "ActorCritic",  # 默认类名（作为占位符）
-                                          # 实际使用我们自定义的CNNMLPActorCritic
+                                          # 实际使用我们自定义的MLPActorCritic
 
             "activation": "elu",  # 激活函数类型
                                   # ELU比ReLU更平滑
 
-            "actor_hidden_dims": [256, 128],  # Actor网络隐藏层维度
-            "critic_hidden_dims": [256, 128],  # Critic网络隐藏层维度
+            "actor_hidden_dims": [128],  # Actor头隐藏层维度
+            "critic_hidden_dims": [128],  # Critic头隐藏层维度
 
-            "init_noise_std": 0.2,  # 初始动作噪声标准差（降低！）
-                                    # 较小的值使初始策略更保守，避免一开始就翻转
+            "init_noise_std": 0.2,  # 初始动作噪声标准差
+                                    # 较小的值使初始策略更保守
         },
 
-        # ==================== CNN-MLP混合网络配置 ====================
-        # 这些参数用于创建我们自定义的网络
-        "cnn_mlp_policy": {
-            "cnn_channels": [32, 64],  # CNN各层的通道数
-                                       # 两层卷积 + 自适应池化
-
-            "mlp_hidden_dims": [128, 128],  # 状态MLP的隐藏层维度
+        # ==================== 纯MLP网络配置 ====================
+        # 这些参数用于创建我们自定义的纯MLP网络
+        "mlp_policy": {
+            "backbone_hidden_dims": [256, 256, 256],  # 共享backbone的隐藏层维度
+                                                      # 三层全连接提取特征
         },
 
         # ==================== 训练运行器配置 ====================
@@ -197,10 +195,10 @@ def get_cfgs():
         "termination_if_pitch_greater_than": 80,  # pitch角超过80度
         "termination_if_close_to_ground": 0.02,  # 高度低于2cm
 
-        # 起点和终点位置
-        "drone_init_position": [0.0, -2.5, 0.8],  # 无人机初始位置 (x, y, z)
-        "drone_goal_position": [0.0, 2.5, 0.8],   # 目标位置
-        # 任务：从y=-2.5飞到y=2.5，需要穿越障碍物区域
+        # 起点和终点位置（2D平面导航，固定高度0.6m）
+        "drone_init_position": [0.0, -2.5, 0.6],  # 无人机初始位置 (x, y, z)
+        "drone_goal_position": [0.0, 2.5, 0.6],   # 目标位置
+        # 任务：从y=-2.5飞到y=2.5，在0.6m高度平面上穿越障碍物区域
 
         # Episode配置
         "episode_length_s": 30.0,  # 每个episode最大时长（秒）
@@ -215,30 +213,31 @@ def get_cfgs():
         "visualize_camera": False,  # 是否使用录制相机
         "max_visualize_FPS": 60,  # 可视化最大帧率
 
-        # ==================== 障碍物配置 ====================
-        # 10个圆柱形障碍物，形成需要穿越的障碍物阵列
+        # ==================== 障碍物配置（2D平面避障）====================
+        # 10个圆柱形障碍物，中心在0.4m高度，高度0.8m，覆盖0.0-0.8m
+        # 无人机在0.6m高度飞行，必须在XY平面上避开障碍物
         "obstacle_positions": [
             # 第一排（y=-1.5）
-            [-0.5, -1.5, 1.0], [0.5, -1.5, 1.0],
+            [-0.5, -1.5, 0.4], [0.5, -1.5, 0.4],
             # 第二排（y=-0.5）
-            [-1.0, -0.5, 1.0], [0.0, -0.5, 1.0], [1.0, -0.5, 1.0],
+            [-1.0, -0.5, 0.4], [0.0, -0.5, 0.4], [1.0, -0.5, 0.4],
             # 第三排（y=0.5）
-            [-0.5, 0.5, 1.0], [0.5, 0.5, 1.0],
+            [-0.5, 0.5, 0.4], [0.5, 0.5, 0.4],
             # 第四排（y=1.5）
-            [-1.0, 1.5, 1.0], [0.0, 1.5, 1.0], [1.0, 1.5, 1.0],
+            [-1.0, 1.5, 0.4], [0.0, 1.5, 0.4], [1.0, 1.5, 0.4],
         ],
         "obstacle_radius": 0.1,  # 障碍物半径（米）
-        "obstacle_height": 2.0,  # 障碍物高度（米）
+        "obstacle_height": 0.8,  # 障碍物高度（米），覆盖0.0-0.8m
         "obstacle_safe_distance": 0.3,  # 安全距离（开始惩罚的距离）
         "obstacle_collision_distance": 0.12,  # 碰撞距离（终止episode的距离）
 
-        # 障碍物网格感知配置
+        # 障碍物网格感知配置（2D平面，单层）
         "grid_resolution": 0.5,  # 每个网格单元的大小（米）
-                                 # 3x3x3网格覆盖 1.5m x 1.5m x 1.5m 的空间
+                                 # 7x7x1网格覆盖 3.5m x 3.5m x 0.5m 的空间
     }
 
     # ==================== 观测配置 ====================
-    # 总观测维度 = 自身状态(19) + 障碍物网格(7*7*3=147) = 166维
+    # 总观测维度 = 自身状态(19) + 障碍物网格(7*7*1=49) = 68维
     obs_cfg = {
         # 自身状态观测维度分解：
         # - 位置: 3维 (x, y, z)
@@ -251,10 +250,10 @@ def get_cfgs():
         # 总计: 19维
         "num_state_obs": 19,
 
-        # 障碍物感知网格形状 (X, Y, Z) = (7, 7, 3)
-        # 水平方向更宽（7x7），垂直方向较窄（3）
-        # 适合圆柱形障碍物的避障任务
-        "grid_shape": (7, 7, 3),  # 7*7*3 = 147个格子
+        # 障碍物感知网格形状 (X, Y, Z) = (7, 7, 1)
+        # 2D平面导航，只需单层垂直感知
+        # 水平方向7x7覆盖3.5m x 3.5m的区域
+        "grid_shape": (7, 7, 1),  # 7*7*1 = 49个格子
 
         # 观测缩放因子（归一化）
         "obs_scales": {
@@ -389,14 +388,16 @@ def main():
     # ==================== 打印训练信息 ====================
     grid_shape = obs_cfg["grid_shape"]
     print(f"\n{'='*60}")
-    print(f"Single Drone PPO Training with CNN-MLP Architecture")
+    print(f"Single Drone PPO Training - 2D Plane Navigation")
+    print(f"Pure MLP Architecture")
     print(f"{'='*60}")
     print(f"Environments: {args.num_envs}")
     print(f"State obs dim: {env.num_state_obs}")
     print(f"Total obs dim: {env.num_obs} (state={env.num_state_obs} + grid={grid_shape[0]*grid_shape[1]*grid_shape[2]})")
-    print(f"Obstacle grid: {grid_shape[0]}x{grid_shape[1]}x{grid_shape[2]}")
+    print(f"Obstacle grid: {grid_shape[0]}x{grid_shape[1]}x{grid_shape[2]} (2D navigation)")
     print(f"Actions: {env.num_actions}")
     print(f"Max iterations: {args.max_iterations}")
+    print(f"Flight altitude: 0.6m (fixed plane)")
     print(f"{'='*60}\n")
 
     # ==================== 创建训练器 ====================
@@ -404,27 +405,25 @@ def main():
     # 它会创建一个默认的ActorCritic网络，我们稍后会替换它
     runner = OnPolicyRunner(env, train_cfg, log_dir, device=gs.device)
 
-    # ==================== 创建CNN-MLP混合网络 ====================
-    # 使用我们自定义的网络架构替换默认网络
+    # ==================== 创建纯MLP网络 ====================
+    # 使用我们自定义的纯MLP网络架构替换默认网络
     policy_cfg = train_cfg["policy"]
-    cnn_mlp_cfg = train_cfg["cnn_mlp_policy"]
+    mlp_cfg = train_cfg["mlp_policy"]
 
-    actor_critic = CNNMLPActorCritic(
-        num_state_obs=env.num_state_obs,  # 自身状态维度: 19
+    actor_critic = MLPActorCritic(
+        num_obs=env.num_obs,  # 总观测维度: 68 (19+49)
         num_actions=env.num_actions,  # 动作维度: 4
-        grid_size=obs_cfg["grid_shape"],  # 网格形状: (7, 7, 3)
-        cnn_channels=cnn_mlp_cfg["cnn_channels"],  # CNN通道: [32, 64]
-        mlp_hidden_dims=cnn_mlp_cfg["mlp_hidden_dims"],  # MLP隐藏层: [128, 128]
-        actor_hidden_dims=policy_cfg["actor_hidden_dims"],  # Actor隐藏层: [256, 128]
-        critic_hidden_dims=policy_cfg["critic_hidden_dims"],  # Critic隐藏层: [256, 128]
+        backbone_hidden_dims=mlp_cfg["backbone_hidden_dims"],  # Backbone: [256, 256, 256]
+        actor_hidden_dims=policy_cfg["actor_hidden_dims"],  # Actor头: [128]
+        critic_hidden_dims=policy_cfg["critic_hidden_dims"],  # Critic头: [128]
         activation=policy_cfg["activation"],  # 激活函数: elu
-        init_noise_std=policy_cfg["init_noise_std"],  # 初始噪声: 0.5
+        init_noise_std=policy_cfg["init_noise_std"],  # 初始噪声: 0.2
     ).to(gs.device)  # 将网络移到GPU
 
     # 替换runner中的默认网络
     # 这是使用自定义网络的关键步骤
     runner.alg.actor_critic = actor_critic
-    print(f"Replaced default ActorCritic with CNNMLPActorCritic\n")
+    print(f"Replaced default ActorCritic with MLPActorCritic\n")
 
     # ==================== GPU使用验证 ====================
     # 验证模型和数据都在GPU上
@@ -453,23 +452,24 @@ if __name__ == "__main__":
 
 
 """
-# 单无人机PPO训练命令示例
+# 单无人机PPO训练命令示例（纯MLP架构）
 
 # 无可视化（快速训练，推荐用于正式训练）
-python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 4096 --max_iterations 1000
+python single_drone_ppo_train.py -e single-drone-mlp-ppo -B 4096 --max_iterations 1000 --gpu 0
 
 # 带可视化（用于调试和观察学习过程）
-python single_drone_ppo_train.py -e single-drone-cnn-ppo -B 64 --max_iterations 1000 -v
+python single_drone_ppo_train.py -e single-drone-mlp-ppo -B 64 --max_iterations 1000 -v --gpu 0
 
 # 参数说明：
 # -e, --exp_name: 实验名称，日志将保存到 logs/<exp_name>/
 # -B, --num_envs: 并行环境数量
-#   - 4096: 适合训练，需要约8GB显存
+#   - 4096: 适合训练，需要约6GB显存（比CNN+MLP更省内存）
 #   - 64-128: 适合可视化调试
 # --max_iterations: 训练迭代次数
 #   - 每次迭代收集 num_envs * num_steps_per_env 步数据
 #   - 1000次迭代约收集4亿步数据（4096*100*1000）
 # -v, --vis: 启用可视化窗口
+# --gpu: 指定GPU编号（默认0）
 
 # 训练过程中会定期保存检查点到 logs/<exp_name>/
 # 包括：
